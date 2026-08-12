@@ -5,6 +5,7 @@
 
 from dynamo.workflow.builder import StageHandle, Workflow
 from dynamo.workflow.compiler import DeploymentSpec, compile_workflow
+from dynamo.workflow.endpoint import WorkflowEndpointHandler
 from dynamo.workflow.ir import StageIR, WorkflowIR
 from dynamo.workflow.orchestrator import WorkflowOrchestrator
 from dynamo.workflow.plan import ExecutionPlan, InlineBinding, RemoteBinding
@@ -22,6 +23,7 @@ __all__ = [
     "ValueRef",
     "Workflow",
     "WorkflowIR",
+    "WorkflowEndpointHandler",
     "WorkflowExecutionError",
     "WorkflowOrchestrator",
     "WorkflowValidationError",
