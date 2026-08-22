@@ -28,6 +28,9 @@ from dynamo.sglang.engine_generate import (
 )
 from dynamo.sglang.publisher import DynamoSglangPublisher
 from dynamo.sglang.request_handlers.handler_base import BaseWorkerHandler
+from dynamo.sglang.request_handlers.llm.batch_fanout import (
+    native_batch_fanout_capable,
+)
 from dynamo.sglang.request_handlers.llm.mm_disagg_utils import (
     AUDIO_URL_KEY,
     IMAGE_URL_KEY,
@@ -383,6 +386,7 @@ class DecodeWorkerHandler(BaseWorkerHandler):
         )
         return native_generate_stream(self.engine, native_request)
 
+    @native_batch_fanout_capable
     async def generate(
         self, request: Dict[str, Any], context: Context
     ) -> AsyncGenerator[Dict[str, Any], None]:

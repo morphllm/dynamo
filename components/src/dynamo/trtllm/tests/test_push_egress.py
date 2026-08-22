@@ -281,9 +281,9 @@ class TestShapeClaim:
 
     def test_pull_mode_returns_async_generator(self):
         result = self._make_pull_result()
-        assert hasattr(
-            result, "__anext__"
-        ), "pull mode fallback returned something without __anext__"
+        assert hasattr(result, "__anext__"), (
+            "pull mode fallback returned something without __anext__"
+        )
 
     def test_drive_push_egress_stream_is_async_generator_function(self):
         assert inspect.isasyncgenfunction(drive_push_egress_stream), (
@@ -362,9 +362,9 @@ class TestTermination:
     def test_zero_chunk_stream_closes_sender(self):
         sender = FakeSender()
         run(drive_push_egress(gen(), sender))
-        assert (
-            sender.close_count == 1
-        ), f"empty stream: expected 1 close, got {sender.close_count}"
+        assert sender.close_count == 1, (
+            f"empty stream: expected 1 close, got {sender.close_count}"
+        )
         assert sender.error_close_count == 0
 
     @pytest.mark.parametrize(
@@ -434,9 +434,9 @@ class TestTermination:
     def test_at_most_one_close_total(self):
         sender = FakeSender()
         run(drive_push_egress(gen("x"), sender))
-        assert (
-            sender.total_closes == 1
-        ), f"stream closed {sender.total_closes} times (expected exactly 1)"
+        assert sender.total_closes == 1, (
+            f"stream closed {sender.total_closes} times (expected exactly 1)"
+        )
 
     def test_send_raising_propagates(self):
         """A failing `send` is how the consumer-gone case surfaces.
@@ -539,9 +539,9 @@ class TestFallbackPath:
             decorated(dummy, request={}, context=None)
 
         notices = [r for r in caplog.records if "response_sender" in r.message]
-        assert (
-            len(notices) == 1
-        ), f"expected exactly 1 notice about missing sender, got {len(notices)}"
+        assert len(notices) == 1, (
+            f"expected exactly 1 notice about missing sender, got {len(notices)}"
+        )
         assert notices[0].levelno == logging.INFO, (
             "the pull arm is a normal path, not a fault; logging it at "
             f"{notices[0].levelname} cries wolf on every health check"
@@ -771,8 +771,8 @@ class TestDecoratorAppliedToRealHandlers:
 # ===========================================================================
 
 
-class TestNoBleedIntoOtherEngines:
-    """Only TRT-LLM handlers may be push-capable.
+class TestNoBleedIntoOtherHandlers:
+    """Only the explicit backend adapters may be push-capable.
 
     `Endpoint.serve_endpoint` is shared by every Python worker -- vLLM, SGLang,
     frontend, planner, router, mocker, and more -- and the ONLY thing keeping
@@ -802,37 +802,45 @@ class TestNoBleedIntoOtherEngines:
                 hits.append(node.name)
         return hits
 
-    def test_only_trtllm_handlers_declare_response_sender(self):
+    ALLOWED_MODULES: ClassVar[set[str]] = {
+        "dynamo/trtllm/request_handlers/push_egress.py",
+        "dynamo/sglang/request_handlers/llm/batch_fanout.py",
+    }
+
+    def test_only_push_adapters_declare_response_sender(self):
         offenders = {}
         for path in (_COMPONENTS_SRC / "dynamo").rglob("*.py"):
-            if "/trtllm/" in path.as_posix():
-                continue  # the one engine that is supposed to have it
+            relative = path.relative_to(_COMPONENTS_SRC).as_posix()
+            if "/tests/" in f"/{relative}":
+                continue
+            if relative in self.ALLOWED_MODULES:
+                continue
             hits = self._declares_response_sender(path)
             if hits:
-                offenders[path.relative_to(_COMPONENTS_SRC).as_posix()] = hits
+                offenders[relative] = hits
 
         assert not offenders, (
-            "non-TRT-LLM code declares a `response_sender` parameter: "
+            "code outside the push adapters declares a `response_sender` parameter: "
             f"{offenders}. Endpoint.serve_endpoint selects the push egress "
             "engine purely on that parameter name, so these handlers would be "
             "driven in push mode without ever pushing -- silently degrading "
             "to the forward-yield path. Rename the parameter."
         )
 
-    def test_trtllm_side_is_where_it_lives(self):
-        """Sanity check on the scan: it must actually find the trtllm ones.
+    def test_push_adapters_are_where_response_sender_lives(self):
+        """Sanity check on the scan: it must find both push adapters.
 
         Guards against the walk silently matching nothing (wrong root, changed
         layout), which would make the test above vacuously green forever.
         """
         found = {}
-        for path in (_COMPONENTS_SRC / "dynamo" / "trtllm").rglob("*.py"):
+        for relative in self.ALLOWED_MODULES:
+            path = _COMPONENTS_SRC / relative
             hits = self._declares_response_sender(path)
             if hits:
-                found[path.name] = hits
+                found[relative] = hits
 
-        assert "push_egress.py" in found, (
-            f"scan found no response_sender parameter in trtllm/push_egress.py "
-            f"(found: {found}); the AST walk is probably broken, which would "
-            "make the no-bleed assertion vacuous"
+        assert found.keys() == self.ALLOWED_MODULES, (
+            "scan did not find response_sender in every push adapter "
+            f"(found: {found}); the AST walk may be broken"
         )
