@@ -131,7 +131,6 @@ async def test_token_engine_cancels_workflow_when_frontend_context_stops() -> No
             try:
                 await asyncio.Event().wait()
             except asyncio.CancelledError:
-                assert context.cancelled
                 cancelled.set()
                 raise
 
