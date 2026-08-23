@@ -11,7 +11,7 @@ from typing import Any, cast
 
 from dynamo.workflow.dispatcher import StageDispatcher
 from dynamo.workflow.ir import StageIR, WorkflowIR
-from dynamo.workflow.runtime import StageContext, WorkflowAttempt
+from dynamo.workflow.runtime import StageContext
 from dynamo.workflow.types import ValueRef
 
 
@@ -22,9 +22,7 @@ class GraphScheduler:
         self._workflow = workflow
         self._dispatcher = dispatcher
 
-    async def run(
-        self, inputs: Mapping[str, Any], attempt: WorkflowAttempt
-    ) -> dict[str, Any]:
+    async def run(self, inputs: Mapping[str, Any], attempt_id: str) -> dict[str, Any]:
         tasks: dict[str, asyncio.Task[dict[str, Any]]] = {}
 
         async def run_stage(stage: StageIR) -> dict[str, Any]:
@@ -39,11 +37,7 @@ class GraphScheduler:
                 StageContext(
                     workflow_name=self._workflow.name,
                     stage_id=stage.id,
-                    attempt_id=attempt.attempt_id,
-                    invocation_id=f"{attempt.attempt_id}:{stage.id}",
-                    deadline=attempt.deadline,
-                    _cancelled=attempt.cancelled,
-                    request_context=attempt.request_context,
+                    attempt_id=attempt_id,
                 ),
             )
 
@@ -66,7 +60,6 @@ class GraphScheduler:
             )
             return dict(zip(self._workflow.outputs, output_values))
         except BaseException:
-            attempt.cancelled.set()
             for task in tasks.values():
                 if not task.done():
                     task.cancel()
