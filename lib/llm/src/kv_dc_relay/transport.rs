@@ -11,6 +11,8 @@ mod load;
 mod metrics;
 mod server;
 mod source;
+#[cfg(test)]
+mod test_support;
 
 pub(crate) use server::KvDcRelayTransport;
 pub(crate) use source::WanPublicationSource;
