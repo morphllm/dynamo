@@ -22,6 +22,8 @@ def test_fresh_main_default_still_watches_all_namespaces() -> None:
     assert config.watch_all is True
     assert config.namespaces == ()
     assert config.endpoint_prefixes == ()
+    assert config.indexer_semantics == ()
+    assert config.indexer_routing_scope == ()
     assert config.bind is None
     assert config.expected_unique_blocks == 1_048_576
     assert config.tuning == ()
@@ -72,6 +74,37 @@ def test_environment_values_and_cli_precedence() -> None:
     assert config.endpoint_prefixes == ("cli-a.backend", "cli-b.backend")
     assert config.bind == "0.0.0.0:50051"
     assert config.tuning == (("publication_threshold", 7),)
+
+
+def test_explicit_indexer_identity_is_canonicalized() -> None:
+    config = parse_args(
+        [
+            "--dc-id",
+            "dc-a",
+            "--watch-all",
+            "--indexer-semantics",
+            "revision=abc",
+            "--indexer-semantics",
+            "model=dsv4flash",
+            "--indexer-routing-scope",
+            "service=morph-dsv4flash",
+        ],
+        {},
+    )
+
+    assert config.indexer_semantics == (("model", "dsv4flash"), ("revision", "abc"))
+    assert config.indexer_routing_scope == (("service", "morph-dsv4flash"),)
+
+
+@pytest.mark.parametrize(
+    "value", ["missing-separator", "=value", "key=", "key=value", "key=other"]
+)
+def test_explicit_indexer_identity_rejects_invalid_entries(value: str) -> None:
+    args = ["--dc-id", "dc-a", "--watch-all", "--indexer-semantics", value]
+    if value.startswith("key=") and value != "key=":
+        args.extend(["--indexer-semantics", "key=duplicate"])
+    with pytest.raises(SystemExit):
+        parse_args(args, {})
 
 
 def test_tuning_is_collected_from_environment_only() -> None:

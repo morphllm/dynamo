@@ -6,7 +6,8 @@ use std::sync::Arc;
 
 use arc_swap::{ArcSwap, Guard};
 use dynamo_kv_router::identity::{
-    CacheSemanticsId, CanonicalIdentityMaterial, DcId, IndexerDomainId, PoolId, RoutingScopeId,
+    CacheSemanticsId, CanonicalIdentityMaterial, DcId, IndexerDomainId, IndexerIdentitySpec,
+    PoolId, RoutingScopeId,
 };
 use dynamo_kv_router::indexer::cuckoo::{CKF_LANE_COUNT, GlobalCkfIndexer};
 use dynamo_runtime::protocols::EndpointId;
@@ -202,9 +203,16 @@ pub(crate) fn resolve_indexer_domain(
     card: &ModelDeploymentCard,
     serving_endpoint: &EndpointId,
 ) -> Result<ResolvedIndexerDomain, KvQuerySemanticsError> {
+    resolve_indexer_domain_with_identity(card, serving_endpoint, card.indexer_identity.as_ref())
+}
+
+pub(crate) fn resolve_indexer_domain_with_identity(
+    card: &ModelDeploymentCard,
+    serving_endpoint: &EndpointId,
+    spec: Option<&IndexerIdentitySpec>,
+) -> Result<ResolvedIndexerDomain, KvQuerySemanticsError> {
     let hash_format = KvQueryHashFormat::from_enable_eagle(card.runtime_config.enable_eagle);
     let query_semantics = KvQuerySemantics::new(card.kv_cache_block_size, hash_format)?;
-    let spec = card.indexer_identity.as_ref();
     let semantic_material = CanonicalIdentityMaterial::cache_semantics(
         &[card.source_path()],
         spec.and_then(|spec| spec.semantics()),
@@ -336,6 +344,30 @@ mod tests {
         assert_ne!(pool_a, pool_b);
         assert_eq!(a.id.cache_semantics().source(), IdentitySource::Explicit);
         assert_eq!(a.id.routing_scope().source(), IdentitySource::Explicit);
+    }
+
+    #[test]
+    fn relay_override_applies_without_mutating_model_cards() {
+        let explicit = ExplicitIdentityMap::new(BTreeMap::from([(
+            "federation".to_string(),
+            "dsv4flash".to_string(),
+        )]))
+        .unwrap();
+        let spec = IndexerIdentitySpec::new(Some(explicit.clone()), Some(explicit));
+        let first = resolve_indexer_domain_with_identity(
+            &card("first", "repo/first"),
+            &EndpointId::from("dc-a/router/generate"),
+            Some(&spec),
+        )
+        .unwrap();
+        let second = resolve_indexer_domain_with_identity(
+            &card("second", "repo/second"),
+            &EndpointId::from("dc-b/router/generate"),
+            Some(&spec),
+        )
+        .unwrap();
+
+        assert_eq!(first.id, second.id);
     }
 
     #[test]

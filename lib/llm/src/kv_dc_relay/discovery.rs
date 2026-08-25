@@ -6,6 +6,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
+use dynamo_kv_router::identity::IndexerIdentitySpec;
 use dynamo_kv_router::protocols::WorkerId;
 use dynamo_runtime::discovery::{
     Discovery, DiscoveryEvent, DiscoveryInstance, DiscoveryInstanceId, DiscoveryQuery,
@@ -20,7 +21,7 @@ use tokio_util::sync::CancellationToken;
 use super::identity::{
     CanonicalModelId, CanonicalModelRegistration, ModelAlias, ModelTarget, WorkerRole,
 };
-use super::resolution::{ResolvedIndexerDomain, resolve_indexer_domain};
+use super::resolution::{ResolvedIndexerDomain, resolve_indexer_domain_with_identity};
 use crate::local_model::runtime_config::ModelRuntimeConfig;
 use crate::model_card::ModelDeploymentCard;
 use crate::model_type::ModelType;
@@ -44,6 +45,7 @@ pub struct KvDcRelayDiscoveryConfig {
     pub namespaces: Vec<String>,
     pub endpoint_prefixes: Vec<String>,
     pub watch_all: bool,
+    pub indexer_identity: Option<IndexerIdentitySpec>,
 }
 
 impl KvDcRelayDiscoveryConfig {
@@ -117,6 +119,7 @@ impl KvDcRelayDiscoveryConfig {
     fn filter(&self) -> DcDiscoveryFilter {
         DcDiscoveryFilter {
             endpoint_prefixes: self.endpoint_prefixes.clone(),
+            indexer_identity: self.indexer_identity.clone(),
         }
     }
 }
@@ -124,6 +127,7 @@ impl KvDcRelayDiscoveryConfig {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct DcDiscoveryFilter {
     endpoint_prefixes: Vec<String>,
+    indexer_identity: Option<IndexerIdentitySpec>,
 }
 
 impl DcDiscoveryFilter {
@@ -599,7 +603,22 @@ impl MembershipState {
                         continue;
                     }
                 }
-                let domain = match resolve_indexer_domain(card, &endpoint) {
+                if let (Some(configured), Some(advertised)) =
+                    (&filter.indexer_identity, &card.indexer_identity)
+                {
+                    if configured != advertised {
+                        query_semantics_conflicts.push(MaterializationConflict::pool(
+                            MaterializationConflictSubject::Card(id.clone()),
+                            "model card indexer identity conflicts with the relay override",
+                        ));
+                        continue;
+                    }
+                }
+                let identity = filter
+                    .indexer_identity
+                    .as_ref()
+                    .or(card.indexer_identity.as_ref());
+                let domain = match resolve_indexer_domain_with_identity(card, &endpoint, identity) {
                     Ok(domain) => Some(domain),
                     Err(error) => {
                         diagnostics.invalid_query_semantics.insert(id.clone());
@@ -1282,6 +1301,7 @@ mod tests {
             namespaces: vec!["prod-a".into(), "prod-b".into()],
             endpoint_prefixes: vec!["prod-a.backend".into()],
             watch_all: false,
+            ..Default::default()
         };
         assert!(config.validate().is_ok());
         assert_eq!(
@@ -1307,6 +1327,7 @@ mod tests {
             namespaces: vec!["prod-a".into()],
             endpoint_prefixes: vec!["prod-b.backend".into()],
             watch_all: false,
+            ..Default::default()
         };
         assert!(config.validate().is_err());
     }
@@ -1317,6 +1338,7 @@ mod tests {
             namespaces: vec![" prod-a".into()],
             endpoint_prefixes: Vec::new(),
             watch_all: false,
+            ..Default::default()
         };
         assert!(padded_namespace.validate().is_err());
 
@@ -1324,6 +1346,7 @@ mod tests {
             namespaces: vec!["prod-a".into()],
             endpoint_prefixes: vec!["prod-a.backend ".into()],
             watch_all: false,
+            ..Default::default()
         };
         assert!(padded_prefix.validate().is_err());
     }
