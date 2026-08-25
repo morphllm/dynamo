@@ -18,10 +18,13 @@ use dynamo_runtime::protocols::EndpointId;
 use dynamo_runtime::{
     DistributedRuntime, Runtime, distributed::DistributedConfig, traits::DistributedRuntimeProvider,
 };
+use tempfile::TempDir;
 use tokio::net::TcpStream;
 use tokio_util::sync::CancellationToken;
 use tonic::Streaming;
-use tonic::transport::{Channel, Endpoint};
+use tonic::transport::{
+    Certificate, Channel, ClientTlsConfig, Endpoint, Identity as ClientIdentity,
+};
 
 use super::super::discovery::{
     DcMembershipView, DomainWorkerTopology, EndpointMembership, KvCacheDomainKey,
@@ -39,6 +42,7 @@ use super::super::topology::TopologyPublisher;
 use super::super::transport_config::KvDcRelayTransportConfig;
 use super::server::KvDcRelayTransport;
 use super::source::WanPublicationSource;
+use super::test_support::{TestPki, test_pki, tls_test_config};
 use crate::kv_dc_relay::actor::KvDcRelayHandle;
 use crate::local_model::runtime_config::ModelRuntimeConfig;
 
@@ -48,6 +52,8 @@ const WORKER_ID: u64 = 7;
 static NEXT_FIXTURE_ID: AtomicU64 = AtomicU64::new(1);
 
 struct RelayFixture {
+    _temp: TempDir,
+    pki: TestPki,
     address: SocketAddr,
     transport: KvDcRelayTransport,
     registry: Arc<PoolRegistry>,
@@ -106,7 +112,9 @@ impl RelayFixture {
             relay_identity,
             lifecycle,
         );
-        let mut config = KvDcRelayTransportConfig::new("127.0.0.1:0".parse().unwrap());
+        let pki = test_pki();
+        let temp = TempDir::new().unwrap();
+        let mut config = tls_test_config(&temp, &pki);
         configure(&mut config);
         let transport = KvDcRelayTransport::start(source, config).await.unwrap();
         let address = transport
@@ -114,6 +122,8 @@ impl RelayFixture {
             .bound_address
             .expect("transport must expose its bound address");
         Self {
+            _temp: temp,
+            pki,
             address,
             transport,
             registry,
@@ -124,7 +134,15 @@ impl RelayFixture {
     }
 
     async fn client(&self) -> proto::KvEventRelayClient<Channel> {
-        proto::KvEventRelayClient::new(connect(self.address).await.unwrap())
+        proto::KvEventRelayClient::new(
+            connect(
+                self.address,
+                &self.pki,
+                Some((&self.pki.client_cert_pem, &self.pki.client_key_pem)),
+            )
+            .await
+            .unwrap(),
+        )
     }
 
     fn actor(&self) -> &KvDcRelayHandle {
@@ -246,12 +264,25 @@ fn stored(event_id: u64, hash: u64) -> RouterEvent {
     )
 }
 
-async fn connect(address: SocketAddr) -> anyhow::Result<Channel> {
-    Ok(Endpoint::from_shared(format!("http://{address}"))?
-        .connect_timeout(IO_TIMEOUT)
-        .timeout(IO_TIMEOUT)
-        .connect()
-        .await?)
+async fn connect(
+    address: SocketAddr,
+    pki: &TestPki,
+    identity: Option<(&str, &str)>,
+) -> anyhow::Result<Channel> {
+    let mut tls = ClientTlsConfig::new()
+        .ca_certificate(Certificate::from_pem(&pki.ca_pem))
+        .domain_name("localhost");
+    if let Some((cert, key)) = identity {
+        tls = tls.identity(ClientIdentity::from_pem(cert, key));
+    }
+    Ok(
+        Endpoint::from_shared(format!("https://127.0.0.1:{}", address.port()))?
+            .connect_timeout(IO_TIMEOUT)
+            .timeout(IO_TIMEOUT)
+            .tls_config(tls)?
+            .connect()
+            .await?,
+    )
 }
 
 fn relay_info_request() -> proto::RelayInfoRequest {
@@ -260,8 +291,12 @@ fn relay_info_request() -> proto::RelayInfoRequest {
     }
 }
 
-async fn relay_info(address: SocketAddr) -> anyhow::Result<proto::RelayInfo> {
-    let channel = connect(address).await?;
+async fn relay_info_with_identity(
+    address: SocketAddr,
+    pki: &TestPki,
+    identity: Option<(&str, &str)>,
+) -> anyhow::Result<proto::RelayInfo> {
+    let channel = connect(address, pki, identity).await?;
     let mut client = proto::KvEventRelayClient::new(channel);
     Ok(client
         .get_relay_info(relay_info_request())
@@ -403,13 +438,45 @@ async fn subscribe_pool(
 }
 
 #[tokio::test]
-async fn actual_relay_transport_accepts_plaintext_grpc() {
+async fn actual_relay_transport_requires_trusted_authorized_client() {
     let fixture = RelayFixture::start(|_| {}).await;
 
-    let info = tokio::time::timeout(IO_TIMEOUT, relay_info(fixture.address))
+    assert!(
+        relay_info_with_identity(fixture.address, &fixture.pki, None)
+            .await
+            .is_err()
+    );
+    assert!(
+        relay_info_with_identity(
+            fixture.address,
+            &fixture.pki,
+            Some((
+                &fixture.pki.wrong_client_cert_pem,
+                &fixture.pki.wrong_client_key_pem
+            ))
+        )
         .await
-        .expect("plaintext Relay request timed out")
-        .expect("plaintext Relay request failed");
+        .is_err()
+    );
+    assert!(
+        relay_info_with_identity(
+            fixture.address,
+            &fixture.pki,
+            Some((
+                &fixture.pki.unauthorized_client_cert_pem,
+                &fixture.pki.unauthorized_client_key_pem
+            ))
+        )
+        .await
+        .is_err()
+    );
+    let info = relay_info_with_identity(
+        fixture.address,
+        &fixture.pki,
+        Some((&fixture.pki.client_cert_pem, &fixture.pki.client_key_pem)),
+    )
+    .await
+    .unwrap();
     assert_eq!(info.protocol_version, proto::RELAY_PROTOCOL_VERSION);
     assert_eq!(info.contract_marker, proto::RELAY_CONTRACT_MARKER);
 
