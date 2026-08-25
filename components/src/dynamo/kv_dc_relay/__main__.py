@@ -76,8 +76,13 @@ async def worker(runtime: DistributedRuntime) -> None:
         namespaces=list(args.namespaces),
         endpoint_prefixes=list(args.endpoint_prefixes),
         watch_all=args.watch_all,
+        indexer_semantics=dict(args.indexer_semantics) or None,
+        indexer_routing_scope=dict(args.indexer_routing_scope) or None,
         expected_unique_blocks=args.expected_unique_blocks,
         bind=args.bind,
+        tls_server_cert=args.tls_server_cert,
+        tls_server_key=args.tls_server_key,
+        tls_client_ca=args.tls_client_ca,
         tuning=dict(args.tuning) or None,
     )
     await relay.start()

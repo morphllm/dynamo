@@ -33,8 +33,13 @@ impl KvDcRelay {
         namespaces=None,
         endpoint_prefixes=None,
         watch_all=None,
+        indexer_semantics=None,
+        indexer_routing_scope=None,
         expected_unique_blocks=1_048_576,
         bind=None,
+        tls_server_cert=None,
+        tls_server_key=None,
+        tls_client_ca=None,
         tuning=None,
     ))]
     #[allow(clippy::too_many_arguments)]
@@ -49,8 +54,13 @@ impl KvDcRelay {
         namespaces: Option<Vec<String>>,
         endpoint_prefixes: Option<Vec<String>>,
         watch_all: Option<bool>,
+        indexer_semantics: Option<std::collections::BTreeMap<String, String>>,
+        indexer_routing_scope: Option<std::collections::BTreeMap<String, String>>,
         expected_unique_blocks: usize,
         bind: Option<String>,
+        tls_server_cert: Option<String>,
+        tls_server_key: Option<String>,
+        tls_client_ca: Option<String>,
         tuning: Option<std::collections::HashMap<String, u64>>,
     ) -> PyResult<Self> {
         if namespace_filter.is_some() && namespaces.is_some() {
@@ -79,12 +89,50 @@ impl KvDcRelay {
             ));
         }
 
+        let tls_count = [
+            tls_server_cert.as_ref(),
+            tls_server_key.as_ref(),
+            tls_client_ca.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .count();
+        if bind.is_some() && tls_count != 3 {
+            return Err(PyValueError::new_err(
+                "bind requires tls_server_cert, tls_server_key, and tls_client_ca",
+            ));
+        }
+        if bind.is_none() && tls_count != 0 {
+            return Err(PyValueError::new_err(
+                "TLS configuration requires bind to enable the WAN server",
+            ));
+        }
+
         #[cfg(not(feature = "kv-dc-relay-wan"))]
         if bind.is_some() {
             return Err(PyRuntimeError::new_err(
                 "this Python extension was built without the kv-dc-relay-wan feature",
             ));
         }
+
+        let explicit_map = |entries: Option<std::collections::BTreeMap<String, String>>| {
+            entries
+                .map(dynamo_kv_router::identity::ExplicitIdentityMap::new)
+                .transpose()
+                .map_err(|error| PyValueError::new_err(error.to_string()))
+        };
+        let indexer_identity = match (
+            explicit_map(indexer_semantics)?,
+            explicit_map(indexer_routing_scope)?,
+        ) {
+            (None, None) => None,
+            (semantics, routing_scope) => Some(
+                dynamo_kv_router::identity::IndexerIdentitySpec::new(
+                    semantics,
+                    routing_scope,
+                ),
+            ),
+        };
 
         let mut producer = llm_rs::kv_dc_relay::KvDcRelayProducerConfig {
             publication_threshold,
@@ -95,14 +143,20 @@ impl KvDcRelay {
         };
 
         #[cfg(feature = "kv-dc-relay-wan")]
-        let mut transport = match bind {
-            Some(bind) => {
+        let mut transport = match (bind, tls_server_cert, tls_server_key, tls_client_ca) {
+            (Some(bind), Some(tls_server_cert), Some(tls_server_key), Some(tls_client_ca)) => {
                 let bind = bind.parse().map_err(|error| {
                     PyValueError::new_err(format!("invalid KV DC Relay bind address: {error}"))
                 })?;
-                Some(llm_rs::kv_dc_relay::KvDcRelayTransportConfig::new(bind))
+                Some(llm_rs::kv_dc_relay::KvDcRelayTransportConfig::new(
+                    bind,
+                    tls_server_cert.into(),
+                    tls_server_key.into(),
+                    tls_client_ca.into(),
+                ))
             }
-            None => None,
+            (None, None, None, None) => None,
+            _ => unreachable!("TLS tuple validated above"),
         };
 
         for (key, &value) in tuning.iter().flatten() {
@@ -203,6 +257,7 @@ impl KvDcRelay {
                     namespaces,
                     endpoint_prefixes,
                     watch_all,
+                    indexer_identity,
                 },
                 producer,
                 #[cfg(feature = "kv-dc-relay-wan")]

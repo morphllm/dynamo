@@ -42,8 +42,13 @@ class KvDcRelayCliConfig:
     namespaces: tuple[str, ...]
     endpoint_prefixes: tuple[str, ...]
     watch_all: bool
+    indexer_semantics: tuple[tuple[str, str], ...]
+    indexer_routing_scope: tuple[tuple[str, str], ...]
     expected_unique_blocks: int
     bind: str | None
+    tls_server_cert: str | None
+    tls_server_key: str | None
+    tls_client_ca: str | None
     tuning: tuple[tuple[str, int], ...]
 
 
@@ -88,6 +93,20 @@ def _environment_bool(
     if normalized in {"0", "false", "no", "off"}:
         return False
     parser.error(f"{name} must be a boolean value")
+
+
+def _identity_entries(
+    values: Sequence[str] | None, option: str, parser: argparse.ArgumentParser
+) -> tuple[tuple[str, str], ...]:
+    entries: dict[str, str] = {}
+    for value in values or ():
+        key, separator, entry_value = value.partition("=")
+        if not separator or not key or not entry_value:
+            parser.error(f"{option} requires KEY=VALUE")
+        if key in entries:
+            parser.error(f"{option} contains duplicate key {key!r}")
+        entries[key] = entry_value
+    return tuple(sorted(entries.items()))
 
 
 def _numeric_value(
@@ -148,10 +167,25 @@ def parse_args(
         dest="endpoint_prefixes",
         help="Endpoint prefix to include; repeat the option for multiple prefixes",
     )
+    parser.add_argument(
+        "--indexer-semantics",
+        action="append",
+        metavar="KEY=VALUE",
+        help="Override cache semantics identity material; repeat for multiple entries",
+    )
+    parser.add_argument(
+        "--indexer-routing-scope",
+        action="append",
+        metavar="KEY=VALUE",
+        help="Override routing scope identity material; repeat for multiple entries",
+    )
 
     parser.add_argument("--expected-unique-blocks", type=_positive_int)
 
-    parser.add_argument("--bind", help="Plaintext WAN gRPC listen address")
+    parser.add_argument("--bind", help="mTLS WAN gRPC listen address")
+    parser.add_argument("--tls-server-cert")
+    parser.add_argument("--tls-server-key")
+    parser.add_argument("--tls-client-ca")
 
     parsed = parser.parse_args(argv)
     dc_id = _string_value(parsed.dc_id, environment, "DYN_DC_ID")
@@ -239,6 +273,24 @@ def parse_args(
     bind = _string_value(parsed.bind, environment, "DYN_RELAY_BIND")
     if bind is not None and not bind.strip():
         parser.error("--bind must not be empty")
+    tls_server_cert = _string_value(
+        parsed.tls_server_cert, environment, "DYN_RELAY_TLS_SERVER_CERT"
+    )
+    tls_server_key = _string_value(
+        parsed.tls_server_key, environment, "DYN_RELAY_TLS_SERVER_KEY"
+    )
+    tls_client_ca = _string_value(
+        parsed.tls_client_ca, environment, "DYN_RELAY_TLS_CLIENT_CA"
+    )
+    tls_values = (tls_server_cert, tls_server_key, tls_client_ca)
+    if any(value is not None and not value for value in tls_values):
+        parser.error("TLS paths must not be empty")
+    if bind is not None and any(value is None for value in tls_values):
+        parser.error(
+            "--bind requires --tls-server-cert, --tls-server-key, and --tls-client-ca"
+        )
+    if bind is None and any(value is not None for value in tls_values):
+        parser.error("TLS options require --bind")
 
     tuning: list[tuple[str, int]] = []
     for key in TUNING_KEYS:
@@ -256,6 +308,12 @@ def parse_args(
         namespaces=namespaces,
         endpoint_prefixes=endpoint_prefixes,
         watch_all=watch_all,
+        indexer_semantics=_identity_entries(
+            parsed.indexer_semantics, "--indexer-semantics", parser
+        ),
+        indexer_routing_scope=_identity_entries(
+            parsed.indexer_routing_scope, "--indexer-routing-scope", parser
+        ),
         expected_unique_blocks=_numeric_value(
             parsed.expected_unique_blocks,
             environment,
@@ -264,6 +322,9 @@ def parse_args(
             parser,
         ),
         bind=bind,
+        tls_server_cert=tls_server_cert,
+        tls_server_key=tls_server_key,
+        tls_client_ca=tls_client_ca,
         tuning=tuple(tuning),
     )
 

@@ -38,7 +38,9 @@ kv-dc-relay-wan = [
   "dep:tonic-health",
   "dep:tonic-reflection",
   "tokio-stream/net",
+  "tonic/tls-aws-lc",
   "tonic/zstd",
+  "dep:x509-parser",
 ]
 kv-router-stress = ["dep:clap", "dep:indicatif", "bench"]
 mm-routing = ["dep:llm-multimodal", "dep:llm-tokenizer"]
@@ -173,6 +175,7 @@ utoipa-swagger-ui = { version = "9.0", features = ["axum"] }
 tonic = { version = "0.13.1" }
 tonic-health = { workspace = true, optional = true }
 tonic-reflection = { version = "0.13.1", optional = true }
+x509-parser = { version = "0.16", optional = true }
 # Request prost specifically so tonic-build properly compiles protobuf message
 prost = { version = "0.13.5" }
 

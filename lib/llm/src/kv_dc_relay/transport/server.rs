@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use std::fs;
 use std::future::Future as _;
 use std::io;
 use std::net::SocketAddr;
@@ -21,8 +22,9 @@ use tokio_stream::StreamExt as _;
 use tokio_stream::wrappers::TcpListenerStream;
 use tokio_util::sync::{CancellationToken, WaitForCancellationFutureOwned};
 use tonic::codec::CompressionEncoding;
-use tonic::transport::Server;
 use tonic::transport::server::Connected;
+use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
+use x509_parser::prelude::FromDer as _;
 
 use super::super::protocol::{FILE_DESCRIPTOR_SET, KvEventRelayServer};
 use super::super::transport_config::KvDcRelayTransportConfig;
@@ -35,6 +37,8 @@ pub(crate) struct KvDcRelayTransportHealth {
     pub(crate) enabled: bool,
     pub(crate) serving: bool,
     pub(crate) bound_address: Option<SocketAddr>,
+    pub(crate) server_cert_not_after: Option<i64>,
+    pub(crate) client_ca_not_after: Option<i64>,
     pub(crate) last_error: Option<String>,
 }
 
@@ -142,6 +146,7 @@ impl KvDcRelayTransport {
         config: KvDcRelayTransportConfig,
     ) -> anyhow::Result<Self> {
         config.validate()?;
+        let (tls, server_cert_not_after, client_ca_not_after) = build_tls_config(&config)?;
         let reflection = tonic_reflection::server::Builder::configure()
             .register_encoded_file_descriptor_set(FILE_DESCRIPTOR_SET)
             .build_v1()
@@ -158,6 +163,8 @@ impl KvDcRelayTransport {
             enabled: true,
             serving: false,
             bound_address: Some(bound_address),
+            server_cert_not_after,
+            client_ca_not_after,
             last_error: None,
         }));
         let load_window = Duration::from_millis(config.load_window_ms);
@@ -194,6 +201,8 @@ impl KvDcRelayTransport {
         let router = Server::builder()
             .http2_keepalive_interval(Some(Duration::from_millis(config.keepalive_interval_ms)))
             .http2_keepalive_timeout(Some(Duration::from_millis(config.keepalive_timeout_ms)))
+            .tls_config(tls)
+            .context("configuring KV Relay mTLS")?
             .add_service(service)
             .add_service(health_service)
             .add_service(reflection);
@@ -204,7 +213,9 @@ impl KvDcRelayTransport {
         health.write().serving = true;
         tracing::info!(
             bind = %bound_address,
-            "Started KV DC Relay WAN plaintext gRPC transport"
+            ?server_cert_not_after,
+            ?client_ca_not_after,
+            "Started KV DC Relay WAN transport with mandatory mTLS"
         );
 
         let server_cancel = cancel.clone();
@@ -279,6 +290,61 @@ impl KvDcRelayTransport {
         }
         self.health.write().serving = false;
     }
+}
+
+fn build_tls_config(
+    config: &KvDcRelayTransportConfig,
+) -> anyhow::Result<(ServerTlsConfig, Option<i64>, Option<i64>)> {
+    ensure_rustls_crypto_provider()?;
+    let cert = fs::read(&config.tls_server_cert).with_context(|| {
+        format!(
+            "reading KV Relay TLS server certificate {}",
+            config.tls_server_cert.display()
+        )
+    })?;
+    let key = fs::read(&config.tls_server_key).with_context(|| {
+        format!(
+            "reading KV Relay TLS server key {}",
+            config.tls_server_key.display()
+        )
+    })?;
+    let client_ca = fs::read(&config.tls_client_ca).with_context(|| {
+        format!(
+            "reading KV Relay TLS client CA {}",
+            config.tls_client_ca.display()
+        )
+    })?;
+    let server_cert_not_after = earliest_not_after(&cert);
+    let client_ca_not_after = earliest_not_after(&client_ca);
+    Ok((
+        ServerTlsConfig::new()
+            .identity(Identity::from_pem(cert, key))
+            .client_ca_root(Certificate::from_pem(client_ca)),
+        server_cert_not_after,
+        client_ca_not_after,
+    ))
+}
+
+fn ensure_rustls_crypto_provider() -> anyhow::Result<()> {
+    if rustls::crypto::CryptoProvider::get_default().is_none() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    }
+    anyhow::ensure!(
+        rustls::crypto::CryptoProvider::get_default().is_some(),
+        "failed to install a process-level rustls crypto provider"
+    );
+    Ok(())
+}
+
+fn earliest_not_after(pem: &[u8]) -> Option<i64> {
+    x509_parser::pem::Pem::iter_from_buffer(pem)
+        .filter_map(|pem| {
+            let pem = pem.ok()?;
+            let (_, certificate) =
+                x509_parser::certificate::X509Certificate::from_der(&pem.contents).ok()?;
+            Some(certificate.validity().not_after.timestamp())
+        })
+        .min()
 }
 
 impl Drop for KvDcRelayTransport {

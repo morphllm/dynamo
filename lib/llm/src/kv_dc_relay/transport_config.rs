@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::time::Duration;
 
 const CBI1_ENVELOPE_HEADROOM: usize = 64 * 1024;
@@ -15,6 +16,9 @@ const MAX_LOAD_FANOUT_CAPACITY: usize = 65_536;
 #[derive(Debug, Clone)]
 pub struct KvDcRelayTransportConfig {
     pub bind: SocketAddr,
+    pub tls_server_cert: PathBuf,
+    pub tls_server_key: PathBuf,
+    pub tls_client_ca: PathBuf,
     pub max_message_bytes: usize,
     pub keepalive_interval_ms: u64,
     pub keepalive_timeout_ms: u64,
@@ -35,10 +39,18 @@ pub struct KvDcRelayTransportConfig {
 }
 
 impl KvDcRelayTransportConfig {
-    /// Plaintext gRPC transport configuration with default tuning bounds.
-    pub fn new(bind: SocketAddr) -> Self {
+    /// Mandatory mTLS transport configuration with default tuning bounds.
+    pub fn new(
+        bind: SocketAddr,
+        tls_server_cert: PathBuf,
+        tls_server_key: PathBuf,
+        tls_client_ca: PathBuf,
+    ) -> Self {
         Self {
             bind,
+            tls_server_cert,
+            tls_server_key,
+            tls_client_ca,
             max_message_bytes: 8 * 1024 * 1024,
             keepalive_interval_ms: 20_000,
             keepalive_timeout_ms: 10_000,
@@ -60,6 +72,18 @@ impl KvDcRelayTransportConfig {
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.tls_server_cert.as_os_str().is_empty(),
+            "KV DC Relay WAN transport requires a TLS server certificate"
+        );
+        anyhow::ensure!(
+            !self.tls_server_key.as_os_str().is_empty(),
+            "KV DC Relay WAN transport requires a TLS server key"
+        );
+        anyhow::ensure!(
+            !self.tls_client_ca.as_os_str().is_empty(),
+            "KV DC Relay WAN transport requires a client CA for mTLS"
+        );
         let now = tokio::time::Instant::now();
         for (name, millis) in [
             ("keepalive_interval_ms", self.keepalive_interval_ms),
@@ -154,7 +178,12 @@ mod tests {
     use super::*;
 
     fn valid_config() -> KvDcRelayTransportConfig {
-        KvDcRelayTransportConfig::new("127.0.0.1:0".parse().unwrap())
+        KvDcRelayTransportConfig::new(
+            "127.0.0.1:0".parse().unwrap(),
+            "server.crt".into(),
+            "server.key".into(),
+            "ca.crt".into(),
+        )
     }
 
     #[test]
@@ -192,7 +221,12 @@ mod tests {
     #[test]
     fn arbitrary_bind_address_is_preserved() {
         let wildcard: SocketAddr = "0.0.0.0:5561".parse().unwrap();
-        let config = KvDcRelayTransportConfig::new(wildcard);
+        let config = KvDcRelayTransportConfig::new(
+            wildcard,
+            "server.crt".into(),
+            "server.key".into(),
+            "ca.crt".into(),
+        );
         assert_eq!(config.bind, wildcard);
         config.validate().unwrap();
     }
