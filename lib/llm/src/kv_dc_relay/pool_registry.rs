@@ -970,6 +970,7 @@ impl PoolRegistry {
         hub.subscribe()
     }
 
+    #[cfg(feature = "kv-dc-relay-wan")]
     pub(super) fn publication_metrics(&self) -> PoolPublicationMetrics {
         let state = self.state.lock();
         let mut metrics = PoolPublicationMetrics {
