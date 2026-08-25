@@ -2267,7 +2267,10 @@ mod tests {
 
         let missing_parent =
             event_failure_point(KvCacheEventError::ParentBlockNotFound).disposition();
-        assert_eq!(missing_parent.action, CkfFailureAction::RejectSource);
+        assert_eq!(
+            missing_parent.action,
+            CkfFailureAction::ReportResourceFailure
+        );
         assert_eq!(missing_parent.domain, CkfFailureDomain::ProducerCore);
         assert_eq!(missing_parent.commit, CkfCommitState::KnownUnchanged);
 
