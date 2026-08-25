@@ -22,9 +22,12 @@ use tokio_stream::StreamExt as _;
 use tokio_stream::wrappers::TcpListenerStream;
 use tokio_util::sync::{CancellationToken, WaitForCancellationFutureOwned};
 use tonic::codec::CompressionEncoding;
-use tonic::transport::server::Connected;
+use tonic::service::InterceptorLayer;
+use tonic::transport::server::{Connected, TcpConnectInfo, TlsConnectInfo};
 use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
-use x509_parser::prelude::FromDer as _;
+use tonic::{Request, Status};
+use x509_parser::extensions::GeneralName;
+use x509_parser::prelude::{FromDer as _, X509Certificate};
 
 use super::super::protocol::{FILE_DESCRIPTOR_SET, KvEventRelayServer};
 use super::super::transport_config::KvDcRelayTransportConfig;
@@ -149,6 +152,13 @@ impl KvDcRelayTransport {
     ) -> anyhow::Result<Self> {
         config.validate()?;
         let (tls, server_cert_not_after, client_ca_not_after) = build_tls_config(&config)?;
+        let authorized_client_uris = Arc::new(
+            config
+                .tls_authorized_client_uris
+                .iter()
+                .cloned()
+                .collect::<std::collections::HashSet<_>>(),
+        );
         let reflection = tonic_reflection::server::Builder::configure()
             .register_encoded_file_descriptor_set(FILE_DESCRIPTOR_SET)
             .build_v1()
@@ -204,6 +214,9 @@ impl KvDcRelayTransport {
         .max_decoding_message_size(config.max_message_bytes);
         let (health_reporter, health_service) = tonic_health::server::health_reporter();
         let router = Server::builder()
+            .layer(InterceptorLayer::new(move |request| {
+                authorize_client_uri(request, &authorized_client_uris)
+            }))
             .http2_keepalive_interval(Some(Duration::from_millis(config.keepalive_interval_ms)))
             .http2_keepalive_timeout(Some(Duration::from_millis(config.keepalive_timeout_ms)))
             .tls_config(tls)
@@ -297,6 +310,38 @@ impl KvDcRelayTransport {
         }
         self.health.write().serving = false;
         self.metrics_lease.lock().take();
+    }
+}
+
+fn authorize_client_uri(
+    request: Request<()>,
+    authorized: &std::collections::HashSet<String>,
+) -> Result<Request<()>, Status> {
+    let certificates = request
+        .extensions()
+        .get::<TlsConnectInfo<TcpConnectInfo>>()
+        .and_then(TlsConnectInfo::peer_certs)
+        .ok_or_else(|| Status::unauthenticated("client certificate is required"))?;
+    let leaf = certificates
+        .first()
+        .ok_or_else(|| Status::unauthenticated("client certificate is required"))?;
+    let (_, certificate) = X509Certificate::from_der(leaf.as_ref())
+        .map_err(|_| Status::unauthenticated("client certificate is malformed"))?;
+    let san = certificate
+        .subject_alternative_name()
+        .map_err(|_| Status::permission_denied("client URI SAN is malformed"))?
+        .ok_or_else(|| Status::permission_denied("client URI SAN is required"))?;
+    if san
+        .value
+        .general_names
+        .iter()
+        .any(|name| matches!(name, GeneralName::URI(uri) if authorized.contains(*uri)))
+    {
+        Ok(request)
+    } else {
+        Err(Status::permission_denied(
+            "client URI SAN is not authorized",
+        ))
     }
 }
 

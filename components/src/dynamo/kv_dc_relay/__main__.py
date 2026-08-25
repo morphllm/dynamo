@@ -83,6 +83,7 @@ async def worker(runtime: DistributedRuntime) -> None:
         tls_server_cert=args.tls_server_cert,
         tls_server_key=args.tls_server_key,
         tls_client_ca=args.tls_client_ca,
+        tls_authorized_client_uris=list(args.tls_authorized_client_uris) or None,
         tuning=dict(args.tuning) or None,
     )
     await relay.start()

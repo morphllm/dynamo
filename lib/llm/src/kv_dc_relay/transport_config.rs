@@ -19,6 +19,7 @@ pub struct KvDcRelayTransportConfig {
     pub tls_server_cert: PathBuf,
     pub tls_server_key: PathBuf,
     pub tls_client_ca: PathBuf,
+    pub tls_authorized_client_uris: Vec<String>,
     pub max_message_bytes: usize,
     pub keepalive_interval_ms: u64,
     pub keepalive_timeout_ms: u64,
@@ -45,12 +46,14 @@ impl KvDcRelayTransportConfig {
         tls_server_cert: PathBuf,
         tls_server_key: PathBuf,
         tls_client_ca: PathBuf,
+        tls_authorized_client_uris: Vec<String>,
     ) -> Self {
         Self {
             bind,
             tls_server_cert,
             tls_server_key,
             tls_client_ca,
+            tls_authorized_client_uris,
             max_message_bytes: 8 * 1024 * 1024,
             keepalive_interval_ms: 20_000,
             keepalive_timeout_ms: 10_000,
@@ -84,6 +87,21 @@ impl KvDcRelayTransportConfig {
             !self.tls_client_ca.as_os_str().is_empty(),
             "KV DC Relay WAN transport requires a client CA for mTLS"
         );
+        anyhow::ensure!(
+            !self.tls_authorized_client_uris.is_empty(),
+            "KV DC Relay WAN transport requires at least one authorized client URI SAN"
+        );
+        let mut client_uris = std::collections::HashSet::new();
+        for uri in &self.tls_authorized_client_uris {
+            anyhow::ensure!(
+                !uri.is_empty() && uri.contains(':'),
+                "KV DC Relay authorized client URI SAN must be an absolute URI"
+            );
+            anyhow::ensure!(
+                client_uris.insert(uri),
+                "duplicate KV DC Relay authorized client URI SAN: {uri}"
+            );
+        }
         let now = tokio::time::Instant::now();
         for (name, millis) in [
             ("keepalive_interval_ms", self.keepalive_interval_ms),
@@ -183,6 +201,7 @@ mod tests {
             "server.crt".into(),
             "server.key".into(),
             "ca.crt".into(),
+            vec!["spiffe://morph/global-ckf-consumer".into()],
         )
     }
 
@@ -226,6 +245,7 @@ mod tests {
             "server.crt".into(),
             "server.key".into(),
             "ca.crt".into(),
+            vec!["spiffe://morph/global-ckf-consumer".into()],
         );
         assert_eq!(config.bind, wildcard);
         config.validate().unwrap();
