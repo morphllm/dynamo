@@ -25,10 +25,11 @@ pub use v1::{
 #[cfg(feature = "kv-dc-relay-wan")]
 pub use v1::kv_event_relay_server::{KvEventRelay, KvEventRelayServer};
 pub use wire::{
-    WireIdentityError, validate_ckf_format, validate_contract_marker, validate_endpoint_id,
-    validate_model_registration, validate_pool_descriptor, validate_pool_id,
-    validate_producer_identity, validate_protocol_envelope, validate_query_semantics,
-    validate_topology_entry, validate_worker_roles,
+    WireIdentityError, pool_id_from_wire, producer_identity_from_wire, validate_ckf_format,
+    validate_contract_marker, validate_endpoint_id, validate_model_registration,
+    validate_pool_descriptor, validate_pool_id, validate_producer_identity,
+    validate_protocol_envelope, validate_query_semantics, validate_topology_entry,
+    validate_worker_roles,
 };
 
 /// Current Relay protocol revision.

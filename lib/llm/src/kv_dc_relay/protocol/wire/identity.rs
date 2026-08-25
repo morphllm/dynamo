@@ -3,6 +3,14 @@
 
 use std::collections::HashSet;
 
+use dynamo_kv_router::identity::{
+    CacheSemanticsId, DcId, IdentitySource as NativeIdentitySource,
+    IndexerDomainId as NativeIndexerDomainId, PoolId, RoutingScopeId,
+};
+use dynamo_kv_router::indexer::cuckoo::{
+    DcCkfFormatIdentity, ProducerIdentity as NativeProducerIdentity,
+};
+
 use super::super::{
     CkfFormat, DigestIdentity, DynamoEndpointId, IdentitySource as ProtoIdentitySource,
     KvPoolDescriptor, KvPoolId, KvQueryHashFormat, KvQuerySemantics, ModelRegistration,
@@ -157,6 +165,87 @@ pub fn validate_producer_identity(identity: &ProducerIdentity) -> Result<(), Wir
             .as_ref()
             .ok_or(WireIdentityError::MissingField("producer CKF format"))?,
     )
+}
+
+/// Convert a validated Relay producer identity into the native global CKF identity.
+pub fn producer_identity_from_wire(
+    identity: &ProducerIdentity,
+) -> Result<NativeProducerIdentity, WireIdentityError> {
+    validate_producer_identity(identity)?;
+    let pool_id = pool_id_from_wire(
+        identity
+            .pool_id
+            .as_ref()
+            .ok_or(WireIdentityError::MissingField("producer pool ID"))?,
+    )?;
+    let format = identity
+        .ckf_format
+        .as_ref()
+        .ok_or(WireIdentityError::MissingField("producer CKF format"))?;
+    let bucket_count =
+        usize::try_from(format.bucket_count).map_err(|_| WireIdentityError::BucketCountOverflow)?;
+    let native_format = DcCkfFormatIdentity::try_new(format.seed, bucket_count).map_err(|_| {
+        WireIdentityError::UnsupportedBucketCount {
+            actual: format.bucket_count,
+            maximum: MAX_BUCKET_COUNT,
+        }
+    })?;
+    Ok(NativeProducerIdentity::new(
+        pool_id,
+        identity.producer_incarnation,
+        identity.layout_generation,
+        native_format,
+    ))
+}
+
+/// Convert a validated Relay pool identity into its native routing identity.
+pub fn pool_id_from_wire(pool_id: &KvPoolId) -> Result<PoolId, WireIdentityError> {
+    validate_pool_id(pool_id)?;
+    let domain = pool_id
+        .indexer_domain
+        .as_ref()
+        .ok_or(WireIdentityError::MissingField("indexer domain"))?;
+    let cache = domain
+        .cache_semantics
+        .as_ref()
+        .ok_or(WireIdentityError::MissingField("cache semantics"))?;
+    let routing = domain
+        .routing_scope
+        .as_ref()
+        .ok_or(WireIdentityError::MissingField("routing scope"))?;
+    Ok(PoolId::new(
+        NativeIndexerDomainId::new(
+            CacheSemanticsId::new(
+                digest_from_wire("cache semantics", &cache.digest)?,
+                source_from_wire("cache semantics", cache.source)?,
+            ),
+            RoutingScopeId::new(
+                digest_from_wire("routing scope", &routing.digest)?,
+                source_from_wire("routing scope", routing.source)?,
+            ),
+        ),
+        DcId::new(pool_id.dc_id),
+    ))
+}
+
+fn digest_from_wire(field: &'static str, digest: &[u8]) -> Result<[u8; 16], WireIdentityError> {
+    digest
+        .try_into()
+        .map_err(|_| WireIdentityError::DigestLength {
+            field,
+            actual: digest.len(),
+        })
+}
+
+fn source_from_wire(
+    field: &'static str,
+    value: i32,
+) -> Result<NativeIdentitySource, WireIdentityError> {
+    match ProtoIdentitySource::try_from(value) {
+        Ok(ProtoIdentitySource::DefaultDerived) => Ok(NativeIdentitySource::DefaultDerived),
+        Ok(ProtoIdentitySource::Explicit) => Ok(NativeIdentitySource::Explicit),
+        _ => Err(WireIdentityError::IdentitySource { field, value }),
+    }
 }
 
 pub fn validate_endpoint_id(endpoint: &DynamoEndpointId) -> Result<(), WireIdentityError> {
@@ -378,6 +467,21 @@ mod tests {
         }
     }
 
+    fn producer_identity() -> ProducerIdentity {
+        ProducerIdentity {
+            pool_id: Some(pool_id()),
+            producer_incarnation: 9,
+            layout_generation: 7,
+            ckf_format: Some(CkfFormat {
+                format_version: u32::from(FORMAT_VERSION),
+                seed: 0x1234_5678,
+                bucket_count: 1024,
+                fingerprint_bits: u32::from(FINGERPRINT_BITS),
+                slots_per_bucket: u32::from(SLOTS_PER_BUCKET),
+            }),
+        }
+    }
+
     #[test]
     fn full_pool_identity_round_trips_without_loss() {
         let expected = pool_id();
@@ -385,6 +489,44 @@ mod tests {
             .expect("pool identity must decode");
         validate_pool_id(&decoded).expect("pool identity must validate");
         assert_eq!(decoded, expected);
+    }
+
+    #[test]
+    fn producer_identity_converts_to_native_without_loss() {
+        let native = producer_identity_from_wire(&producer_identity()).unwrap();
+        assert_eq!(native.pool_id().dc_id().get(), 0xAABB_CCDD_EEFF_0011);
+        assert_eq!(
+            native.pool_id().indexer_domain().cache_semantics().digest(),
+            [0x11; 16]
+        );
+        assert_eq!(
+            native.pool_id().indexer_domain().routing_scope().digest(),
+            [0x22; 16]
+        );
+        assert_eq!(native.producer_incarnation(), 9);
+        assert_eq!(native.layout_generation(), 7);
+        assert_eq!(native.format().seed(), 0x1234_5678);
+        assert_eq!(native.format().bucket_count(), 1024);
+    }
+
+    #[test]
+    fn producer_identity_conversion_rejects_invalid_nested_values() {
+        let mut identity = producer_identity();
+        identity.pool_id = None;
+        assert_eq!(
+            producer_identity_from_wire(&identity),
+            Err(WireIdentityError::MissingField("producer pool ID"))
+        );
+
+        let mut identity = producer_identity();
+        identity.ckf_format.as_mut().unwrap().bucket_count = 3;
+        assert_eq!(
+            producer_identity_from_wire(&identity),
+            Err(WireIdentityError::UnsupportedBucketCount {
+                actual: 3,
+                maximum: MAX_BUCKET_COUNT,
+            })
+        );
     }
 
     #[test]

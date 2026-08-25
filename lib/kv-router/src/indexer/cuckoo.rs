@@ -129,6 +129,9 @@ pub enum CkfBuildError {
     #[error("publish_every_n_events must be greater than zero")]
     InvalidPublishEveryNEvents,
 
+    #[error("CKF bucket count {value} is not a power of two greater than or equal to two")]
+    InvalidBucketCount { value: usize },
+
     #[error("CKF capacity arithmetic overflowed")]
     CapacityOverflow,
 

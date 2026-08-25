@@ -781,6 +781,26 @@ impl GlobalCkfIngestionPool {
         self.fault_rx.try_recv().ok()
     }
 
+    /// Retire the lane owned by `lease` and fence work admitted under its current epoch.
+    ///
+    /// Readiness is cleared before this method returns. A stale lease cannot retire a newer
+    /// assignment, and a later assignment can recover this lane without disturbing other lanes.
+    pub fn retire_lane(&self, lease: LaneLease) -> Result<(), GlobalCkfIngestionError> {
+        let lane = usize::from(lease.physical_lane());
+        let route = self.route(lane)?;
+        let _transition = route.control.transition.lock();
+        let mut admission = route.control.admission.lock();
+        if admission.lease != Some(lease)
+            || matches!(
+                admission.state,
+                LaneAdmissionState::Unassigned | LaneAdmissionState::Retired
+            )
+        {
+            return Err(GlobalCkfIngestionError::LaneRetired { lane });
+        }
+        retire_admission_locked(&self.indexer, &route.control, lane, &mut admission)
+    }
+
     pub fn assign(
         &self,
         identity: ProducerIdentity,
@@ -1168,13 +1188,6 @@ impl GlobalCkfIngestionPool {
         let (release_tx, release_rx) = flume::bounded(1);
         *route.control.snapshot_activation_pause.lock() = Some((entered_tx, release_rx));
         (entered_rx, release_tx)
-    }
-
-    #[cfg(test)]
-    fn retire_lane_for_test(&self, lane: usize) -> Result<(), GlobalCkfIngestionError> {
-        let route = self.route(lane)?;
-        let mut admission = route.control.admission.lock();
-        retire_admission_locked(&self.indexer, &route.control, lane, &mut admission)
     }
 
     #[cfg(test)]
@@ -1665,15 +1678,63 @@ mod tests {
         thread::scope(|scope| {
             let install = scope.spawn(|| fixture.pool.install_snapshot(snapshot));
             entered.recv_timeout(Duration::from_secs(1)).unwrap();
-            fixture.pool.retire_lane_for_test(fixture.lane).unwrap();
-            assert_eq!(fixture.pool.indexer().ready_lanes(), 0);
+            let retire = scope.spawn(|| fixture.pool.retire_lane(fixture.lease));
             release.send(()).unwrap();
             assert_eq!(
                 install.join().unwrap(),
-                Err(GlobalCkfIngestionError::LaneRetired { lane: fixture.lane })
+                Ok(GlobalCkfIngestOutcome::SnapshotInstalled { sequence: 4 })
             );
+            retire.join().unwrap().unwrap();
         });
         assert_eq!(fixture.pool.indexer().ready_lanes(), 0);
+    }
+
+    #[test]
+    fn stale_retirement_cannot_retire_ready_replacement() {
+        let fixture = Fixture::new(8);
+        fixture.assign_and_snapshot(4);
+        let replacement = LaneLease::new(
+            fixture.lease.consumer_instance(),
+            fixture.lane as u8,
+            fixture.lease.assignment_epoch() + 1,
+        );
+        fixture.pool.assign(fixture.identity, replacement).unwrap();
+        fixture
+            .pool
+            .install_snapshot(GlobalCkfSnapshot::new(
+                fixture.identity,
+                replacement,
+                5,
+                vec![0; fixture.bucket_count].into_boxed_slice(),
+            ))
+            .unwrap();
+
+        assert_eq!(
+            fixture.pool.retire_lane(fixture.lease),
+            Err(GlobalCkfIngestionError::LaneRetired { lane: fixture.lane })
+        );
+        assert_eq!(fixture.pool.indexer().ready_lanes(), 1u16 << fixture.lane);
+    }
+
+    #[test]
+    fn retired_lane_rejects_current_lease_traffic() {
+        let fixture = Fixture::new(8);
+        fixture.assign_and_snapshot(4);
+        fixture.pool.retire_lane(fixture.lease).unwrap();
+        assert_eq!(fixture.pool.indexer().ready_lanes(), 0);
+        assert_eq!(
+            fixture.pool.retire_lane(fixture.lease),
+            Err(GlobalCkfIngestionError::LaneRetired { lane: fixture.lane })
+        );
+        assert_eq!(
+            fixture.pool.install_snapshot(GlobalCkfSnapshot::new(
+                fixture.identity,
+                fixture.lease,
+                5,
+                vec![0; fixture.bucket_count].into_boxed_slice(),
+            )),
+            Err(GlobalCkfIngestionError::LaneRetired { lane: fixture.lane })
+        );
     }
 
     #[test]
@@ -1683,7 +1744,7 @@ mod tests {
         fixture.pool.exhaust_lane_epoch_for_test(fixture.lane);
 
         assert_eq!(
-            fixture.pool.retire_lane_for_test(fixture.lane),
+            fixture.pool.retire_lane(fixture.lease),
             Err(GlobalCkfIngestionError::AdmissionEpochExhausted { lane: fixture.lane })
         );
         assert_eq!(fixture.pool.indexer().ready_lanes(), 0);
