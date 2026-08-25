@@ -146,9 +146,6 @@ fn collect_signals(fleet: &FleetState) -> HashMap<PoolId, PoolSignals> {
             signal.load_updated = state.load_updated;
             signal.kv_used_blocks = Some(entry.kv_used_blocks);
             signal.total_kv_blocks = Some(entry.total_kv_blocks);
-            signal.active_decode_blocks = Some(entry.active_decode_blocks);
-            signal.active_prefill_tokens = Some(entry.active_prefill_tokens);
-            signal.prefill_token_capacity = Some(entry.prefill_token_capacity);
         }
     }
     signals
