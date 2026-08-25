@@ -24,12 +24,13 @@ fake_prometheus.Counter = lambda *args, **kwargs: _Metric()
 fake_prometheus.Histogram = lambda *args, **kwargs: _Metric()
 sys.modules.setdefault("prometheus_client", fake_prometheus)
 
-from dynamo.global_router.multi_dc import (  # noqa: E402
+from dynamo.frontend.global_routing import (  # noqa: E402
     MultiDcConfig,
     MultiDcRouter,
     PoolRoute,
     select_pool,
 )
+from dynamo.frontend import global_routing as router_module  # noqa: E402
 
 pytestmark = [pytest.mark.pre_merge, pytest.mark.gpu_0, pytest.mark.unit]
 
@@ -154,10 +155,18 @@ async def test_committed_stream_is_not_retried():
 def test_recursion_marker_is_authenticated():
     router = MultiDcRouter(config(), client=object())
     body = {"model": "model", "chat_template_args": {}}
-    marker = router._marker(body, 2, 123, "nonce")
+    issued_ms = router_module.time.time_ns() // 1_000_000
+    marker = router._marker(body, 2, issued_ms, "nonce")
     assert marker["source_dc"] == 1
     assert marker["target_dc"] == 2
     assert len(marker["signature"]) == 64
+
+    remote_config = config()
+    remote_config = MultiDcConfig(**{**remote_config.__dict__, "local_dc": 2})
+    remote = MultiDcRouter(remote_config, client=object())
+    body["chat_template_args"]["_dynamo_global_router"] = marker
+    assert remote.consume_private_marker(body)
+    assert body["chat_template_args"] == {}
 
 
 def test_enforce_configuration_requires_mtls(tmp_path):

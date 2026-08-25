@@ -1,13 +1,14 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Exact CKF based selection for the aggregated multi data center router mode."""
+"""Exact CKF based global selection at the tokenizing frontend seam."""
 
 from __future__ import annotations
 
 import hashlib
 import hmac
 import json
+import os
 import secrets
 import time
 from dataclasses import dataclass
@@ -96,6 +97,46 @@ class MultiDcConfig:
             facts_timeout_s=float(data.get("facts_timeout_seconds", 1)),
             cert=cert,
             verify=str(ca_file) if ca_file else True,
+        )
+
+    @classmethod
+    def from_env(cls) -> "MultiDcConfig | None":
+        policy = os.getenv("DYN_GLOBAL_ROUTER_POLICY", "off").lower()
+        if policy == "off":
+            return None
+        return cls.from_dict(
+            {
+                "policy": policy,
+                "facts_url": os.environ["DYN_GLOBAL_ROUTER_FACTS_URL"],
+                "local_dc_id": os.environ["DYN_GLOBAL_ROUTER_LOCAL_DC_ID"],
+                "block_size": os.environ["DYN_GLOBAL_ROUTER_BLOCK_SIZE"],
+                "gateways": json.loads(
+                    os.environ.get("DYN_GLOBAL_ROUTER_GATEWAYS_JSON", "{}")
+                ),
+                "hmac_secret_file": os.environ.get(
+                    "DYN_GLOBAL_ROUTER_HMAC_SECRET_FILE", ""
+                ),
+                "client_cert_file": os.environ.get(
+                    "DYN_GLOBAL_ROUTER_CLIENT_CERT_FILE"
+                ),
+                "client_key_file": os.environ.get("DYN_GLOBAL_ROUTER_CLIENT_KEY_FILE"),
+                "ca_file": os.environ.get("DYN_GLOBAL_ROUTER_CA_FILE"),
+                "readiness_max_age_ms": os.environ.get(
+                    "DYN_GLOBAL_ROUTER_READINESS_MAX_AGE_MS", 45_000
+                ),
+                "load_max_age_ms": os.environ.get(
+                    "DYN_GLOBAL_ROUTER_LOAD_MAX_AGE_MS", 15_000
+                ),
+                "marker_max_age_ms": os.environ.get(
+                    "DYN_GLOBAL_ROUTER_MARKER_MAX_AGE_MS", 30_000
+                ),
+                "connect_timeout_seconds": os.environ.get(
+                    "DYN_GLOBAL_ROUTER_CONNECT_TIMEOUT_SECONDS", 2
+                ),
+                "facts_timeout_seconds": os.environ.get(
+                    "DYN_GLOBAL_ROUTER_FACTS_TIMEOUT_SECONDS", 1
+                ),
+            }
         )
 
 
@@ -190,10 +231,49 @@ class MultiDcRouter:
             ),
         )
 
+    @classmethod
+    def from_env(cls, block_size: int) -> "MultiDcRouter | None":
+        config = MultiDcConfig.from_env()
+        if config is None:
+            return None
+        if config.block_size != block_size:
+            raise ValueError(
+                "DYN_GLOBAL_ROUTER_BLOCK_SIZE must match the frontend native block size"
+            )
+        return cls(config)
+
+    def consume_private_marker(self, request: dict[str, Any]) -> bool:
+        args = request.get("chat_template_args")
+        marker = args.pop(_MARKER, None) if isinstance(args, dict) else None
+        if marker is None:
+            return False
+        if not isinstance(marker, dict):
+            raise ValueError("invalid global router marker")
+        try:
+            issued_ms = int(marker["issued_ms"])
+            source_dc = int(marker["source_dc"])
+            target_dc = int(marker["target_dc"])
+            nonce = str(marker["nonce"])
+            signature = str(marker["signature"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError("invalid global router marker") from error
+        now_ms = time.time_ns() // 1_000_000
+        if (
+            target_dc != self.config.local_dc
+            or not 0 <= now_ms - issued_ms <= self.config.marker_max_age_ms
+        ):
+            raise ValueError("expired or misdirected global router marker")
+        expected = self._marker(request, target_dc, issued_ms, nonce, source_dc)[
+            "signature"
+        ]
+        if not hmac.compare_digest(signature, expected):
+            raise ValueError("unauthenticated global router marker")
+        return True
+
     async def decide(
-        self, model: str, token_ids: list[int], request_id: str
+        self, model: str, token_ids: list[int], request_id: str, bypass: bool = False
     ) -> PoolRoute | None:
-        if len(token_ids) < self.config.block_size:
+        if bypass or len(token_ids) < self.config.block_size:
             return None
         started = time.monotonic()
         try:
@@ -231,7 +311,7 @@ class MultiDcRouter:
         )
         target = str(route.target_dc if route is not None else self.config.local_dc)
         DECISIONS.labels(self.config.policy, outcome, target).inc()
-        return route
+        return None if self.config.policy == "shadow" or outcome == "local" else route
 
     async def stream_remote(
         self, route: PoolRoute, openai_request: dict[str, Any], request_id: str
@@ -264,17 +344,25 @@ class MultiDcRouter:
             )
 
     def _marker(
-        self, body: dict[str, Any], target_dc: int, issued_ms: int, nonce: str
+        self,
+        body: dict[str, Any],
+        target_dc: int,
+        issued_ms: int,
+        nonce: str,
+        source_dc: int | None = None,
     ) -> dict[str, Any]:
         unsigned = json.loads(json.dumps(body))
         unsigned.get("chat_template_args", {}).pop(_MARKER, None)
         digest = hashlib.sha256(
             json.dumps(unsigned, sort_keys=True, separators=(",", ":")).encode()
         ).hexdigest()
-        message = f"1\n{self.config.local_dc}\n{target_dc}\n{issued_ms}\n{nonce}\n{digest}".encode()
+        source_dc = self.config.local_dc if source_dc is None else source_dc
+        message = (
+            f"1\n{source_dc}\n{target_dc}\n{issued_ms}\n{nonce}\n{digest}".encode()
+        )
         return {
             "version": 1,
-            "source_dc": self.config.local_dc,
+            "source_dc": source_dc,
             "target_dc": target_dc,
             "issued_ms": issued_ms,
             "nonce": nonce,
