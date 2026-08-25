@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use dynamo_kv_router::identity::PoolId;
 use dynamo_kv_router::indexer::cuckoo::ProducerIdentity;
+use dynamo_runtime::component::Component;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
@@ -16,6 +17,7 @@ use super::super::topology::{TopologyPublisher, TopologySnapshot};
 
 #[derive(Clone)]
 pub(crate) struct WanPublicationSource {
+    component: Component,
     pools: Arc<PoolRegistry>,
     topology: Arc<TopologyPublisher>,
     relay_identity: DcRelayIdentity,
@@ -24,17 +26,31 @@ pub(crate) struct WanPublicationSource {
 
 impl WanPublicationSource {
     pub(crate) fn new(
+        component: Component,
         pools: Arc<PoolRegistry>,
         topology: Arc<TopologyPublisher>,
         relay_identity: DcRelayIdentity,
         lifecycle: CancellationToken,
     ) -> Self {
         Self {
+            component,
             pools,
             topology,
             relay_identity,
             lifecycle,
         }
+    }
+
+    pub(crate) fn component(&self) -> &Component {
+        &self.component
+    }
+
+    pub(crate) fn pools(&self) -> &Arc<PoolRegistry> {
+        &self.pools
+    }
+
+    pub(crate) fn topology(&self) -> &Arc<TopologyPublisher> {
+        &self.topology
     }
 
     pub(crate) const fn relay_identity(&self) -> DcRelayIdentity {

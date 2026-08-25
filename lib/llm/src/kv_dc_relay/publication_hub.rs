@@ -247,6 +247,11 @@ pub(crate) struct PublicationHub {
 }
 
 impl PublicationHub {
+    pub(super) fn metrics_state(&self) -> (bool, bool) {
+        let state = self.inner.state.lock();
+        (state.is_ready, state.subscribers.is_empty())
+    }
+
     pub(super) async fn start(
         actor: KvDcRelayHandle,
         lease: LaneLease,

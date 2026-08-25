@@ -4,6 +4,8 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
+#[cfg(feature = "kv-dc-relay-wan")]
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use dynamo_kv_router::identity::PoolId;
@@ -381,6 +383,17 @@ pub(super) struct PoolRegistry {
     publication_hub_permits: Arc<Semaphore>,
     #[cfg(feature = "kv-dc-relay-wan")]
     max_initialized_pool_hubs: usize,
+    #[cfg(feature = "kv-dc-relay-wan")]
+    terminal_publication_failures: Arc<AtomicU64>,
+}
+
+#[cfg(feature = "kv-dc-relay-wan")]
+pub(super) struct PoolPublicationMetrics {
+    pub(super) requested_hubs: usize,
+    pub(super) initialized_hubs: usize,
+    pub(super) ready_hubs: usize,
+    pub(super) idle_hubs: usize,
+    pub(super) terminal_failures: u64,
 }
 
 impl PoolRegistry {
@@ -443,6 +456,7 @@ impl PoolRegistry {
                 publication_config.max_initialized_pool_hubs,
             )),
             max_initialized_pool_hubs: publication_config.max_initialized_pool_hubs,
+            terminal_publication_failures: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -917,7 +931,9 @@ impl PoolRegistry {
             return Err(PublicationHubError::ProducerMismatch(pool_id));
         }
         let weak = Arc::downgrade(self);
+        let failures = self.terminal_publication_failures.clone();
         let terminal_failure: TerminalFailure = Arc::new(move |reason| {
+            failures.fetch_add(1, Ordering::Relaxed);
             let Some(registry) = weak.upgrade() else {
                 return;
             };
@@ -952,6 +968,32 @@ impl PoolRegistry {
             ));
         }
         hub.subscribe()
+    }
+
+    pub(super) fn publication_metrics(&self) -> PoolPublicationMetrics {
+        let state = self.state.lock();
+        let mut metrics = PoolPublicationMetrics {
+            requested_hubs: 0,
+            initialized_hubs: 0,
+            ready_hubs: 0,
+            idle_hubs: 0,
+            terminal_failures: self.terminal_publication_failures.load(Ordering::Relaxed),
+        };
+        for entry in state.pools.values() {
+            match &*entry.hub.state.lock() {
+                PoolHubState::Vacant | PoolHubState::Retired => {}
+                PoolHubState::Initializing => metrics.requested_hubs += 1,
+                PoolHubState::Failed(_) => metrics.requested_hubs += 1,
+                PoolHubState::Ready(initialized) => {
+                    metrics.requested_hubs += 1;
+                    metrics.initialized_hubs += 1;
+                    let (ready, idle) = initialized.hub.metrics_state();
+                    metrics.ready_hubs += usize::from(ready);
+                    metrics.idle_hubs += usize::from(ready && idle);
+                }
+            }
+        }
+        metrics
     }
 
     pub(super) fn catalog(&self) -> DcPoolCatalog {

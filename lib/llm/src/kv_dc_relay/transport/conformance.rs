@@ -107,6 +107,7 @@ impl RelayFixture {
 
         let lifecycle = CancellationToken::new();
         let source = WanPublicationSource::new(
+            component,
             registry.clone(),
             topology.clone(),
             relay_identity,

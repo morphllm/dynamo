@@ -703,6 +703,7 @@ impl KvDcRelay {
         #[cfg(feature = "kv-dc-relay-wan")]
         let transport = if let Some(transport_config) = transport_config {
             let source = WanPublicationSource::new(
+                component.clone(),
                 pools.clone(),
                 topology.clone(),
                 relay_identity,
