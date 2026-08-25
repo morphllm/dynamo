@@ -40,6 +40,7 @@ impl KvDcRelay {
         tls_server_cert=None,
         tls_server_key=None,
         tls_client_ca=None,
+        tls_authorized_client_uris=None,
         tuning=None,
     ))]
     #[allow(clippy::too_many_arguments)]
@@ -61,6 +62,7 @@ impl KvDcRelay {
         tls_server_cert: Option<String>,
         tls_server_key: Option<String>,
         tls_client_ca: Option<String>,
+        tls_authorized_client_uris: Option<Vec<String>>,
         tuning: Option<std::collections::HashMap<String, u64>>,
     ) -> PyResult<Self> {
         if namespace_filter.is_some() && namespaces.is_some() {
@@ -100,6 +102,16 @@ impl KvDcRelay {
         if bind.is_some() && tls_count != 3 {
             return Err(PyValueError::new_err(
                 "bind requires tls_server_cert, tls_server_key, and tls_client_ca",
+            ));
+        }
+        if bind.is_some() && tls_authorized_client_uris.as_ref().is_none_or(Vec::is_empty) {
+            return Err(PyValueError::new_err(
+                "bind requires at least one tls_authorized_client_uri",
+            ));
+        }
+        if bind.is_none() && tls_authorized_client_uris.is_some() {
+            return Err(PyValueError::new_err(
+                "tls_authorized_client_uris requires bind to enable the WAN server",
             ));
         }
         if bind.is_none() && tls_count != 0 {
@@ -153,6 +165,7 @@ impl KvDcRelay {
                     tls_server_cert.into(),
                     tls_server_key.into(),
                     tls_client_ca.into(),
+                    tls_authorized_client_uris.unwrap_or_default(),
                 ))
             }
             (None, None, None, None) => None,

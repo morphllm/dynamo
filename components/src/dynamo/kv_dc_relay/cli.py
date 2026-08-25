@@ -49,6 +49,7 @@ class KvDcRelayCliConfig:
     tls_server_cert: str | None
     tls_server_key: str | None
     tls_client_ca: str | None
+    tls_authorized_client_uris: tuple[str, ...]
     tuning: tuple[tuple[str, int], ...]
 
 
@@ -186,6 +187,7 @@ def parse_args(
     parser.add_argument("--tls-server-cert")
     parser.add_argument("--tls-server-key")
     parser.add_argument("--tls-client-ca")
+    parser.add_argument("--tls-authorized-client-uri", action="append", dest="tls_authorized_client_uris")
 
     parsed = parser.parse_args(argv)
     dc_id = _string_value(parsed.dc_id, environment, "DYN_DC_ID")
@@ -283,6 +285,7 @@ def parse_args(
         parsed.tls_client_ca, environment, "DYN_RELAY_TLS_CLIENT_CA"
     )
     tls_values = (tls_server_cert, tls_server_key, tls_client_ca)
+    authorized_client_uris = tuple(parsed.tls_authorized_client_uris or ())
     if any(value is not None and not value for value in tls_values):
         parser.error("TLS paths must not be empty")
     if bind is not None and any(value is None for value in tls_values):
@@ -291,6 +294,14 @@ def parse_args(
         )
     if bind is None and any(value is not None for value in tls_values):
         parser.error("TLS options require --bind")
+    if bind is not None and not authorized_client_uris:
+        parser.error("--bind requires at least one --tls-authorized-client-uri")
+    if bind is None and authorized_client_uris:
+        parser.error("--tls-authorized-client-uri requires --bind")
+    if any(not uri or ":" not in uri for uri in authorized_client_uris):
+        parser.error("authorized client URI SANs must be absolute URIs")
+    if len(set(authorized_client_uris)) != len(authorized_client_uris):
+        parser.error("authorized client URI SANs must not contain duplicates")
 
     tuning: list[tuple[str, int]] = []
     for key in TUNING_KEYS:
@@ -325,6 +336,7 @@ def parse_args(
         tls_server_cert=tls_server_cert,
         tls_server_key=tls_server_key,
         tls_client_ca=tls_client_ca,
+        tls_authorized_client_uris=authorized_client_uris,
         tuning=tuple(tuning),
     )
 
