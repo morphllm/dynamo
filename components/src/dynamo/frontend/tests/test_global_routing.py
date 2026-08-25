@@ -3,6 +3,7 @@
 
 import asyncio
 import sys
+from pathlib import Path
 from types import ModuleType
 
 import pytest
@@ -183,3 +184,14 @@ def test_enforce_configuration_requires_mtls(tmp_path):
                 "hmac_secret_file": str(secret),
             }
         )
+
+
+def test_vllm_hook_routes_only_after_native_tokenization():
+    source = (Path(__file__).parents[1] / "vllm_processor.py").read_text()
+    marker = source.index("consume_private_marker(request)")
+    preprocessing = source.index("pre = await preprocess_chat_request(")
+    native_tokens = source.index("tokens = pre.prompt_token_ids")
+    decision = source.index("remote_route = await self.global_router.decide(")
+
+    assert marker < preprocessing < native_tokens < decision
+    assert 'request["openai_request"]' not in source
