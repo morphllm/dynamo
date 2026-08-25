@@ -234,8 +234,10 @@ fn event_failure_point(error: KvCacheEventError) -> CkfFailurePoint {
     match error {
         KvCacheEventError::CapacityExhausted => CkfFailurePoint::BoundedRelocationFailure,
         KvCacheEventError::AllocationFailed => CkfFailurePoint::PrecommitAllocationFailure,
+        // MORPH: a missing parent is a lineage gap to RECOVER (rank tree-dump replay),
+        // not a source-protocol violation to reject — see failure.rs::SourceLineageGap.
+        KvCacheEventError::ParentBlockNotFound => CkfFailurePoint::SourceLineageGap,
         KvCacheEventError::OwnershipDegreeOverflow
-        | KvCacheEventError::ParentBlockNotFound
         | KvCacheEventError::BlockNotFound
         | KvCacheEventError::InvalidBlockSequence => CkfFailurePoint::SourceProtocolFailure,
         KvCacheEventError::IndexerInvariantViolation => CkfFailurePoint::PrewriteInvariantMismatch,
@@ -1094,6 +1096,14 @@ async fn run_actor(
     let _stopped_guard = CancelOnDrop(stopped);
     let mut unknown_removal_events = 0u64;
     let mut capacity_omission_events = 0u64;
+    // MORPH: per-rank rate limit for lineage-gap recovery. handle_target_fault re-spawns
+    // (cancelling in-flight) recovery on every fault, so a cascading subtree of misses
+    // must not storm it: one recovery request per rank per window; misses inside the
+    // window are omitted (stable false negatives until the replay lands).
+    const LINEAGE_RECOVERY_WINDOW: std::time::Duration = std::time::Duration::from_secs(30);
+    let mut lineage_recovery_at: std::collections::HashMap<(WorkerId, DpRank), std::time::Instant> =
+        std::collections::HashMap::new();
+    let mut lineage_gap_omissions = 0u64;
     let mut shutdown_response = None;
     let mut discard_tail = false;
     let publication_timer = tokio::time::sleep(Duration::ZERO);
@@ -1179,6 +1189,33 @@ async fn run_actor(
                     publication_timer_armed = true;
                 }
                 if let Some(error) = first_error {
+                    if matches!(error, KvCacheEventError::ParentBlockNotFound) {
+                        let now = std::time::Instant::now();
+                        let recent = lineage_recovery_at
+                            .get(&(worker_id, dp_rank))
+                            .is_some_and(|at| now.duration_since(*at) < LINEAGE_RECOVERY_WINDOW);
+                        if recent {
+                            lineage_gap_omissions = lineage_gap_omissions.saturating_add(1);
+                            if lineage_gap_omissions.is_power_of_two() {
+                                tracing::debug!(
+                                    worker_id,
+                                    dp_rank,
+                                    event_id,
+                                    lineage_gap_omissions,
+                                    "KV DC Relay omitted a lineage-gap store while rank recovery is pending"
+                                );
+                            }
+                            diagnostics.finish_command();
+                            continue;
+                        }
+                        lineage_recovery_at.insert((worker_id, dp_rank), now);
+                        tracing::warn!(
+                            worker_id,
+                            dp_rank,
+                            event_id,
+                            "KV DC Relay lineage gap (parent not found): requesting rank recovery, source retained"
+                        );
+                    }
                     let disposition = event_failure_point(error).disposition();
                     if disposition.action == CkfFailureAction::ContinueCapacityOmission {
                         // NOTE: A bounded relocation miss is a deterministic physical-index
@@ -1418,7 +1455,20 @@ fn replacement_state(
     dp_rank: DpRank,
     events: Vec<RouterEvent>,
 ) -> Result<DcCkfRankReplacement, KvDcRelayError> {
+    // MORPH v3: a live worker's KV tree dump is NOT a clean root-anchored, parents-first
+    // forest. Real prefix caches evict cold ancestors (leaving orphaned children) and may
+    // not serialize strictly parent-first. Upstream fails the WHOLE rank on the first such
+    // block ("not canonical replay order"), so recovery never lands and the gapped rank
+    // stays fenced (the v2 symptom). Instead, replay as a bounded fixpoint: retry
+    // ParentBlockNotFound (its parent may appear later in the dump = reorder-tolerant), and
+    // drop InvalidBlockSequence (a true orphan whose parent was evicted — unreconstructable,
+    // a stable false negative for that subtree). push_event fails BEFORE any mutation
+    // (prepare_store only touches scratch), so a deferred event is safe to retry and a
+    // dropped one leaves no partial state. Every block whose full ancestor chain survives
+    // in the dump is restored; only genuinely-orphaned subtrees stay missing.
+    const MAX_REPLAY_PASSES: usize = 16;
     let mut replacement = DcCkfRankReplacement::new();
+    let mut pending: Vec<RouterEvent> = Vec::with_capacity(events.len());
     for event in events {
         if event.worker_id != worker_id || event.event.dp_rank != dp_rank {
             return Err(KvDcRelayError::InvalidTreeDump {
@@ -1427,16 +1477,51 @@ fn replacement_state(
                 message: "event identity does not match replacement rank".to_string(),
             });
         }
-        replacement.push_event(event).map_err(|error| match error {
-            KvCacheEventError::AllocationFailed => KvDcRelayError::Build(
-                dynamo_kv_router::indexer::cuckoo::CkfBuildError::AllocationFailed,
-            ),
-            _ => KvDcRelayError::InvalidTreeDump {
-                worker_id,
-                dp_rank,
-                message: format!("tree dump is not canonical replay order: {error}"),
-            },
-        })?;
+        pending.push(event);
+    }
+    let mut orphaned = 0u64;
+    let mut passes = 0usize;
+    loop {
+        let before = pending.len();
+        let mut deferred: Vec<RouterEvent> = Vec::new();
+        for event in pending.drain(..) {
+            match replacement.push_event(event.clone()) {
+                Ok(()) => {}
+                Err(KvCacheEventError::ParentBlockNotFound) => deferred.push(event),
+                Err(KvCacheEventError::InvalidBlockSequence) => {
+                    orphaned = orphaned.saturating_add(1);
+                }
+                Err(KvCacheEventError::AllocationFailed) => {
+                    return Err(KvDcRelayError::Build(
+                        dynamo_kv_router::indexer::cuckoo::CkfBuildError::AllocationFailed,
+                    ));
+                }
+                Err(error) => {
+                    return Err(KvDcRelayError::InvalidTreeDump {
+                        worker_id,
+                        dp_rank,
+                        message: format!("unrecoverable tree-dump event: {error}"),
+                    });
+                }
+            }
+        }
+        pending = deferred;
+        passes += 1;
+        // Stop when a pass places nothing new (the remainder are true orphans) or the
+        // pass cap bounds the pathological fully-reversed dump to O(16n).
+        if pending.is_empty() || pending.len() == before || passes >= MAX_REPLAY_PASSES {
+            break;
+        }
+    }
+    orphaned = orphaned.saturating_add(pending.len() as u64);
+    if orphaned > 0 {
+        tracing::warn!(
+            worker_id,
+            dp_rank,
+            orphaned,
+            passes,
+            "KV DC Relay tree-dump replay skipped orphan blocks (evicted ancestors); rank restored from anchored roots"
+        );
     }
     Ok(replacement)
 }

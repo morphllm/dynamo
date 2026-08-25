@@ -41,6 +41,11 @@ pub enum CkfFailurePoint {
     BoundedRelocationFailure,
     PrecommitAllocationFailure,
     SourceProtocolFailure,
+    /// MORPH: a live Stored event whose parent is outside this source's lineage window
+    /// (late-join / eviction gap). prepare_store fails before any mutation, so commit is
+    /// known-unchanged; the right response is RANK RECOVERY (worker tree-dump replay
+    /// reseeds lineage and restores the subtree), never source rejection.
+    SourceLineageGap,
     PrewriteInvariantMismatch,
     ConsumerGapOrMalformedBeforeWrite,
     ConsumerWorkerFailureMidApply,
@@ -86,6 +91,14 @@ impl CkfFailurePoint {
                 commit: KnownUnchanged,
                 recovery_domain: None,
                 action: RejectSource,
+            },
+            // MORPH: ReportResourceFailure is the action the Relay host routes through
+            // RecoverySupervisor::handle_target_fault (spawn_recovery -> replace_rank).
+            Self::SourceLineageGap => CkfFailureDisposition {
+                domain: ProducerCore,
+                commit: KnownUnchanged,
+                recovery_domain: None,
+                action: ReportResourceFailure,
             },
             Self::PrewriteInvariantMismatch => CkfFailureDisposition {
                 domain: ProducerCore,
