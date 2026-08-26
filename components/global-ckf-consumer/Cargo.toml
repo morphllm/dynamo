@@ -9,7 +9,7 @@ repository.workspace = true
 anyhow.workspace = true
 axum.workspace = true
 clap.workspace = true
-dynamo-llm = { workspace = true, features = ["kv-dc-relay-proto"] }
+dynamo-llm = { workspace = true, default-features = false, features = ["kv-dc-relay-proto"] }
 dynamo-kv-router.workspace = true
 serde.workspace = true
 serde_json.workspace = true

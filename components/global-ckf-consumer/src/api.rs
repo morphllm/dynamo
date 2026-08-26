@@ -17,6 +17,7 @@ use dynamo_kv_router::protocols::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::contract::{DecisionOutcome, QueryRole, TokenDecisionRequest, TokenDecisionResponse};
 use crate::lane::{LaneAvailability, LaneSet, LaneUnavailableReason};
 use crate::policy::{
     Freshness, LaneFact, OccupancyFact, PolicyInput, PoolFacts, ReadinessFact, select_pool,
@@ -199,35 +200,6 @@ struct TokenPrefixMatchesRequest {
     is_eagle: Option<bool>,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct TokenDecisionRequest {
-    #[serde(flatten)]
-    query: TokenPrefixMatchesRequest,
-    local_dc: u64,
-    stable_tie_key: u64,
-    readiness_max_age_ms: u64,
-    load_max_age_ms: u64,
-}
-
-#[derive(Debug, Serialize)]
-struct TokenDecisionResponse {
-    generation: u64,
-    selected_pool_id: Option<String>,
-    selected_dc: Option<u64>,
-    outcome: &'static str,
-    matched_prefix_blocks: Option<u64>,
-    uncached_prefill_tokens: Option<u64>,
-}
-
-#[derive(Debug, Clone, Copy, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum QueryRole {
-    Aggregated,
-    Prefill,
-    Decode,
-}
-
 #[derive(Debug, Serialize)]
 struct PrefixMatchesResponse {
     generation: u64,
@@ -256,19 +228,19 @@ impl From<QueryRole> for QueryRoleResponse {
 }
 
 #[derive(Debug, Serialize)]
-struct PoolFact {
+pub(crate) struct PoolFact {
     #[serde(skip)]
-    native_pool_id: PoolId,
+    pub(crate) native_pool_id: PoolId,
     pool_id: String,
     indexer_domain: IndexerDomainFact,
-    relay: String,
-    dc_id: u64,
+    pub(crate) relay: String,
+    pub(crate) dc_id: u64,
     physical_lane: u8,
     availability: &'static str,
     unavailable_reason: Option<&'static str>,
     prefix_depth_blocks: Option<u32>,
     producer_incarnation: Option<u64>,
-    layout_generation: Option<u64>,
+    pub(crate) layout_generation: Option<u64>,
     installed_sequence: Option<u64>,
     freshness_age_ms: Option<u64>,
     readiness: Vec<ReadinessSignal>,
@@ -417,33 +389,111 @@ async fn token_decision(
     max_query_blocks: usize,
 ) -> Response {
     state.metrics.queries.fetch_add(1, Ordering::Relaxed);
-    if request.query.model.trim().is_empty() {
+    if request.model.trim().is_empty() {
         return decision_error(&state, ApiError::bad_request("model must not be empty"));
     }
-    let hashes = match native_hashes(&request.query, max_query_blocks) {
+    let query = TokenPrefixMatchesRequest {
+        model: request.model.clone(),
+        role: request.role,
+        token_ids: request.token_ids.clone(),
+        block_size: request.block_size,
+        block_mm_infos: request.block_mm_infos.clone(),
+        lora_name: request.lora_name.clone(),
+        cache_namespace: request.cache_namespace.clone(),
+        is_eagle: request.is_eagle,
+    };
+    let hashes = match native_hashes(&query, max_query_blocks) {
         Ok(hashes) => hashes,
         Err(error) => return decision_error(&state, error),
     };
-    let (generation, pools) = match collect_facts(
+    let evaluated = match evaluate_decision(
         &state,
-        Some(&request.query.model),
-        request.query.role,
+        &request.model,
+        request.role,
         &hashes,
+        request.block_size,
+        request.local_dc,
+        request.stable_tie_key,
+        request.readiness_max_age_ms,
+        request.load_max_age_ms,
     ) {
-        Ok(result) => result,
+        Ok(evaluated) => evaluated,
         Err(error) => return decision_error(&state, error),
     };
+    let (
+        selected_pool_id,
+        selected_dc,
+        selected_region,
+        outcome,
+        matched_prefix_blocks,
+        uncached_prefill_tokens,
+    ) = match evaluated.decision.selected {
+        Some(selected) => {
+            let dc = selected.pool_id.dc_id().get();
+            let selected_region = evaluated
+                .pools
+                .iter()
+                .find(|pool| pool.native_pool_id == selected.pool_id)
+                .map(|pool| pool.relay.clone());
+            (
+                Some(selected.pool_id.to_string()),
+                Some(dc),
+                selected_region,
+                if dc == request.local_dc {
+                    DecisionOutcome::Local
+                } else {
+                    DecisionOutcome::Remote
+                },
+                Some(selected.matched_prefix_blocks),
+                Some(selected.uncached_prefill_tokens),
+            )
+        }
+        None => (None, None, None, DecisionOutcome::None, None, None),
+    };
+    Json(TokenDecisionResponse {
+        generation: evaluated.generation,
+        selected_pool_id,
+        selected_dc,
+        selected_region,
+        outcome,
+        matched_prefix_blocks,
+        uncached_prefill_tokens,
+    })
+    .into_response()
+}
+
+pub(crate) struct EvaluatedDecision {
+    pub(crate) generation: u64,
+    pub(crate) decision: crate::policy::PolicyDecision,
+    pub(crate) pools: Vec<PoolFact>,
+}
+
+/// Evaluate the exact routing policy over the current published facts.
+/// The single evaluation path for both the decision API and the dispatcher,
+/// so their outcomes and decision metrics can never diverge.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn evaluate_decision(
+    state: &AppState,
+    model: &str,
+    role: QueryRole,
+    hashes: &[u64],
+    block_size: u32,
+    local_dc: u64,
+    stable_tie_key: u64,
+    readiness_max_age_ms: u64,
+    load_max_age_ms: u64,
+) -> Result<EvaluatedDecision, ApiError> {
+    let (generation, pools) = collect_facts(state, Some(model), role, hashes)?;
     if pools.is_empty() {
-        return decision_error(
-            &state,
-            ApiError::not_found("no catalog pool matches model and role"),
-        );
+        return Err(ApiError::not_found(
+            "no catalog pool matches model and role",
+        ));
     }
     let input = PolicyInput {
-        local_dc: dynamo_kv_router::identity::DcId::new(request.local_dc),
+        local_dc: dynamo_kv_router::identity::DcId::new(local_dc),
         query_block_count: hashes.len() as u64,
-        native_block_size_tokens: request.query.block_size as u64,
-        stable_tie_key: request.stable_tie_key,
+        native_block_size_tokens: block_size as u64,
+        stable_tie_key,
     };
     let candidates = pools.iter().map(|pool| PoolFacts {
         pool_id: pool.native_pool_id,
@@ -454,12 +504,13 @@ async fn token_decision(
         },
         matched_prefix_blocks: u64::from(pool.prefix_depth_blocks.unwrap_or(0)),
         readiness: pool.readiness_age_ms.map(|age| ReadinessFact {
-            ready: pool.readiness.iter().any(|signal| {
-                signal.canonical_model_id == request.query.model && signal.state == 2
-            }),
+            ready: pool
+                .readiness
+                .iter()
+                .any(|signal| signal.canonical_model_id == model && signal.state == 2),
             freshness: Freshness {
                 age: std::time::Duration::from_millis(age),
-                maximum_age: std::time::Duration::from_millis(request.readiness_max_age_ms),
+                maximum_age: std::time::Duration::from_millis(readiness_max_age_ms),
             },
         }),
         occupancy: match (
@@ -482,57 +533,36 @@ async fn token_decision(
                 expected_ranks,
                 freshness: Freshness {
                     age: std::time::Duration::from_millis(age),
-                    maximum_age: std::time::Duration::from_millis(request.load_max_age_ms),
+                    maximum_age: std::time::Duration::from_millis(load_max_age_ms),
                 },
             }),
             _ => None,
         },
     });
-    let decision = match select_pool(input, candidates) {
-        Ok(decision) => decision,
-        Err(_) => return decision_error(&state, ApiError::internal("routing policy failed")),
-    };
-    let (selected_pool_id, selected_dc, outcome, matched_prefix_blocks, uncached_prefill_tokens) =
-        match decision.selected {
-            Some(selected) => {
-                let dc = selected.pool_id.dc_id().get();
-                if dc == request.local_dc {
-                    state
-                        .metrics
-                        .decisions_local
-                        .fetch_add(1, Ordering::Relaxed);
-                } else {
-                    state
-                        .metrics
-                        .decisions_remote
-                        .fetch_add(1, Ordering::Relaxed);
-                }
-                (
-                    Some(selected.pool_id.to_string()),
-                    Some(dc),
-                    if dc == request.local_dc {
-                        "local"
-                    } else {
-                        "remote"
-                    },
-                    Some(selected.matched_prefix_blocks),
-                    Some(selected.uncached_prefill_tokens),
-                )
-            }
-            None => {
-                state.metrics.decisions_none.fetch_add(1, Ordering::Relaxed);
-                (None, None, "none", None, None)
-            }
-        };
-    Json(TokenDecisionResponse {
+    let decision =
+        select_pool(input, candidates).map_err(|_| ApiError::internal("routing policy failed"))?;
+    match decision.selected {
+        Some(selected) if selected.pool_id.dc_id().get() == local_dc => {
+            state
+                .metrics
+                .decisions_local
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        Some(_) => {
+            state
+                .metrics
+                .decisions_remote
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        None => {
+            state.metrics.decisions_none.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    Ok(EvaluatedDecision {
         generation,
-        selected_pool_id,
-        selected_dc,
-        outcome,
-        matched_prefix_blocks,
-        uncached_prefill_tokens,
+        decision,
+        pools,
     })
-    .into_response()
 }
 
 fn decision_error(state: &AppState, error: ApiError) -> Response {
@@ -790,7 +820,7 @@ async fn metrics(State(state): State<AppState>) -> String {
 }
 
 #[derive(Debug)]
-struct ApiError(StatusCode, &'static str);
+pub(crate) struct ApiError(pub(crate) StatusCode, pub(crate) &'static str);
 
 impl ApiError {
     fn bad_request(message: &'static str) -> Self {

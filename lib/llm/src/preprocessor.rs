@@ -5386,7 +5386,7 @@ impl
         >,
     ) -> Result<ManyOut<Annotated<NvCreateChatCompletionStreamResponse>>, Error> {
         // unpack the request
-        let (mut request, context) = request.into_parts();
+        let (mut request, mut context) = request.into_parts();
 
         // Preserve original inbound streaming flag before any internal overrides
         let request_id = context.id().to_string();
@@ -5466,19 +5466,57 @@ impl
             &request_id,
         )?;
 
-        crate::global_routing_shadow::observe(
-            &common_request.model,
-            &common_request.token_ids,
-            self.kv_cache_block_size,
-            &request_id,
-            common_request.multi_modal_data.is_some() || common_request.mm_routing_info.is_some(),
-        );
-
         let uses_tool_call_structural_tag = self.apply_tool_choice_guided_decoding(
             &request,
             &mut common_request,
             prompt_injected_reasoning,
         )?;
+
+        if let Some(decision) = crate::global_routing::decide(
+            &common_request.model,
+            &common_request.token_ids,
+            self.kv_cache_block_size,
+            &request_id,
+            common_request.multi_modal_data.is_some() || common_request.mm_routing_info.is_some(),
+        )
+        .await
+        .map_err(|error| crate::http::service::error::HttpError {
+            code: 503,
+            message: error.to_string(),
+        })? {
+            let mut signed_request = request.clone();
+            signed_request.inner.stream = Some(original_stream_flag);
+            let normalized_body = serde_json::to_value(&signed_request).map_err(|error| {
+                crate::http::service::error::HttpError {
+                    code: 500,
+                    message: format!("failed to serialize normalized request: {error}"),
+                }
+            })?;
+            let signed = crate::global_routing_envelope::mint_signed_routing_decision(
+                decision,
+                context
+                    .metadata()
+                    .get(crate::global_routing_envelope::TRUSTED_AUTH_METADATA_KEY)
+                    .map(String::as_str),
+                &request_id,
+                "/v1/chat/completions",
+                &common_request.model,
+                normalized_body,
+                &common_request.token_ids,
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+            )
+            .map_err(|error| crate::http::service::error::HttpError {
+                code: 503,
+                message: error.to_string(),
+            })?;
+            context.insert(
+                crate::global_routing_envelope::SIGNED_ENVELOPE_CONTEXT_KEY,
+                signed,
+            );
+        }
 
         tracing::trace!(request = ?common_request, prompt_injected_reasoning, "Pre-processed request");
         let trace_state = crate::request_trace::build_request_end_trace_state(
@@ -5617,7 +5655,7 @@ impl
         let _stage_guard = StageGuard::new(STAGE_PREPROCESS, "");
 
         // unpack the request
-        let (mut request, context) = request.into_parts();
+        let (mut request, mut context) = request.into_parts();
         let request_id = context.id().to_string();
 
         // Preserve original streaming flag
@@ -5681,13 +5719,51 @@ impl
             &request_id,
         )?;
 
-        crate::global_routing_shadow::observe(
+        if let Some(decision) = crate::global_routing::decide(
             &common_request.model,
             &common_request.token_ids,
             self.kv_cache_block_size,
             &request_id,
             common_request.multi_modal_data.is_some() || common_request.mm_routing_info.is_some(),
-        );
+        )
+        .await
+        .map_err(|error| crate::http::service::error::HttpError {
+            code: 503,
+            message: error.to_string(),
+        })? {
+            let mut signed_request = request.clone();
+            signed_request.inner.stream = Some(original_stream_flag);
+            let normalized_body = serde_json::to_value(&signed_request).map_err(|error| {
+                crate::http::service::error::HttpError {
+                    code: 500,
+                    message: format!("failed to serialize normalized request: {error}"),
+                }
+            })?;
+            let signed = crate::global_routing_envelope::mint_signed_routing_decision(
+                decision,
+                context
+                    .metadata()
+                    .get(crate::global_routing_envelope::TRUSTED_AUTH_METADATA_KEY)
+                    .map(String::as_str),
+                &request_id,
+                "/v1/completions",
+                &common_request.model,
+                normalized_body,
+                &common_request.token_ids,
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+            )
+            .map_err(|error| crate::http::service::error::HttpError {
+                code: 503,
+                message: error.to_string(),
+            })?;
+            context.insert(
+                crate::global_routing_envelope::SIGNED_ENVELOPE_CONTEXT_KEY,
+                signed,
+            );
+        }
 
         let trace_state = crate::request_trace::build_request_end_trace_state(
             &common_request,

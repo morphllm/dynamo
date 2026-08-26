@@ -1217,6 +1217,9 @@ impl HttpServiceConfigBuilder {
         {
             tracing::warn!("Failed to register global routing envelope metrics: {}", e);
         }
+        if let Err(e) = crate::global_routing::ensure_metrics_registered_prometheus(&registry) {
+            tracing::warn!("Failed to register global routing decision metrics: {}", e);
+        }
         if let Err(e) = ensure_tokio_perf_metrics_registered_prometheus(&registry) {
             tracing::warn!("Failed to register tokio perf metrics: {}", e);
         }
