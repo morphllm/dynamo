@@ -110,6 +110,7 @@ chrono = { version = "0.4", default-features = false, features = [
     "serde",
 ] }
 cudarc = { version = "=0.19.8", features = ["cuda-version-from-build-system", "fallback-latest"] }
+ed25519-dalek = { version = "2.2", features = ["pkcs8", "pem"] }
 dashmap = { version = "6.1" }
 moka = { version = "0.12", features = ["future"] }
 derive_builder = { version = "0.20" }
