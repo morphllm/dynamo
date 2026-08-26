@@ -51,7 +51,7 @@ pub struct PoolFacts {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PolicyInput {
     pub local_dc: DcId,
-    pub query_block_count: u64,
+    pub query_token_count: u64,
     pub native_block_size_tokens: u64,
     pub stable_tie_key: u64,
 }
@@ -158,7 +158,10 @@ fn evaluate_pool(
                 {
                     Some(IneligibleReason::OccupancyIncomplete)
                 }
-                Some(_) if facts.matched_prefix_blocks > input.query_block_count => {
+                Some(_)
+                    if facts.matched_prefix_blocks
+                        > input.query_token_count / input.native_block_size_tokens =>
+                {
                     Some(IneligibleReason::PrefixExceedsQuery)
                 }
                 Some(_) => None,
@@ -170,12 +173,13 @@ fn evaluate_pool(
     }
 
     let occupancy = facts.occupancy.expect("eligible pool has occupancy");
-    let uncached_blocks = input.query_block_count - facts.matched_prefix_blocks;
-    let uncached_prefill_tokens = uncached_blocks
+    let cached_tokens = facts
+        .matched_prefix_blocks
         .checked_mul(input.native_block_size_tokens)
         .ok_or(PolicyError::TokenArithmeticOverflow {
             pool_id: facts.pool_id,
         })?;
+    let uncached_prefill_tokens = input.query_token_count - cached_tokens;
     Ok(Ok(EligiblePool {
         pool_id: facts.pool_id,
         matched_prefix_blocks: facts.matched_prefix_blocks,
@@ -252,7 +256,7 @@ mod tests {
     fn input() -> PolicyInput {
         PolicyInput {
             local_dc: DcId::new(1),
-            query_block_count: 10,
+            query_token_count: 2_600,
             native_block_size_tokens: 256,
             stable_tie_key: 42,
         }
@@ -329,6 +333,24 @@ mod tests {
     }
 
     #[test]
+    fn partial_block_tokens_are_counted_exactly() {
+        let mut short = input();
+        short.query_token_count = 40;
+        let selected = select_pool(short, [facts(1, 0, 0)])
+            .unwrap()
+            .selected
+            .unwrap();
+        assert_eq!(selected.matched_prefix_blocks, 0);
+        assert_eq!(selected.uncached_prefill_tokens, 40);
+
+        let selected = select_pool(input(), [facts(1, 10, 0)])
+            .unwrap()
+            .selected
+            .unwrap();
+        assert_eq!(selected.uncached_prefill_tokens, 40);
+    }
+
+    #[test]
     fn stable_remote_tie_is_deterministic_and_input_order_independent() {
         let east = facts(2, 10, 0);
         let west = facts(3, 10, 0);
@@ -366,20 +388,12 @@ mod tests {
     }
 
     #[test]
-    fn invalid_prefix_and_arithmetic_overflow_never_saturate_into_a_route() {
+    fn invalid_prefix_never_saturates_into_a_route() {
         let invalid = facts(1, 11, 0);
         let decision = select_pool(input(), [invalid]).unwrap();
         assert_eq!(
             decision.ineligible[0].reason,
             IneligibleReason::PrefixExceedsQuery
         );
-
-        let mut huge = input();
-        huge.query_block_count = u64::MAX;
-        huge.native_block_size_tokens = 2;
-        assert!(matches!(
-            select_pool(huge, [facts(1, 0, 0)]),
-            Err(PolicyError::TokenArithmeticOverflow { .. })
-        ));
     }
 }

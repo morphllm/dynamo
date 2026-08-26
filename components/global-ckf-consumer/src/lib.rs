@@ -3,6 +3,7 @@
 
 pub mod api;
 pub mod config;
+pub mod contract;
 pub mod coordinator;
 pub mod lane;
 pub mod policy;

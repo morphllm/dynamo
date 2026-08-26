@@ -98,6 +98,71 @@ pub const ANNOTATION_REQUEST_ID: &str = "request_id";
 
 const VALIDATION_PREFIX: &str = "Validation: ";
 const BATCH_FILE_STORAGE_NOT_IMPLEMENTED: &str = "Batch file storage is not implemented yet.";
+
+fn take_global_wan_response(
+    ctx: &Arc<dyn dynamo_runtime::engine::AsyncEngineContext>,
+    expected_request_id: &str,
+) -> Result<Option<crate::global_routing_transport::WanResponse>, ErrorResponse> {
+    let Some(extension) =
+        ctx.get_extension(crate::global_routing_transport::WAN_RESPONSE_CONTEXT_KEY)
+    else {
+        return Ok(None);
+    };
+    let handle = extension
+        .downcast::<crate::global_routing_transport::WanResponseHandle>()
+        .map_err(|_| {
+            ErrorMessage::internal_server_error("Global WAN response context has the wrong type")
+        })?;
+    let response = handle.take().ok_or_else(|| {
+        ErrorMessage::internal_server_error("Global WAN response was already consumed")
+    })?;
+    let returned_request_id = response.headers.get("x-request-id").ok_or_else(|| {
+        ErrorMessage::internal_server_error("Regional response is missing x-request-id")
+    })?;
+    if returned_request_id.as_bytes() != expected_request_id.as_bytes() {
+        return Err(ErrorMessage::internal_server_error(
+            "Regional response request ID does not match the signed request",
+        ));
+    }
+    Ok(Some(response))
+}
+
+fn relay_global_wan_response(
+    mut response: crate::global_routing_transport::WanResponse,
+    inflight_guard: super::metrics::InflightGuard,
+    http_queue_guard: super::metrics::HttpQueueGuard,
+) -> Result<Response, ErrorResponse> {
+    crate::global_routing_transport::sanitize_response_headers(&mut response.headers);
+    let successful_status = response.status.is_success();
+    let body = async_stream::stream! {
+        let mut body = response.body;
+        let mut inflight_guard = inflight_guard;
+        let mut http_queue_guard = Some(http_queue_guard);
+        while let Some(item) = body.next().await {
+            drop(http_queue_guard.take());
+            match item {
+                Ok(bytes) => yield Ok(bytes),
+                Err(error) => {
+                    inflight_guard.mark_error(ErrorType::Internal);
+                    yield Err(error);
+                    return;
+                }
+            }
+        }
+        drop(http_queue_guard.take());
+        if successful_status {
+            inflight_guard.mark_ok();
+        }
+    };
+    let mut builder = Response::builder().status(response.status);
+    *builder.headers_mut().expect("response builder is valid") = response.headers;
+    builder.body(Body::from_stream(body)).map_err(|error| {
+        ErrorMessage::internal_server_error_with_details(
+            "Failed to relay global WAN response",
+            error.to_string(),
+        )
+    })
+}
 const BATCH_JOB_STATE_NOT_IMPLEMENTED: &str =
     "Batch job lifecycle persistence is not implemented yet.";
 const BATCH_OUTPUT_RETRIEVAL_NOT_IMPLEMENTED: &str =
@@ -2893,6 +2958,10 @@ async fn chat_completions(
 
     // capture the context to cancel the stream if the client disconnects
     let ctx = stream.context();
+
+    if let Some(response) = take_global_wan_response(&ctx, &request_id)? {
+        return relay_global_wan_response(response, inflight_guard, http_queue_guard);
+    }
 
     // prepare any requested annotations
     let annotations = annotations.map_or(Vec::new(), |annotations| {

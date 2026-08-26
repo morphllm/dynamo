@@ -298,6 +298,10 @@ impl AsyncEngineContext for StreamContext {
         self.controller.id()
     }
 
+    fn get_extension(&self, key: &str) -> Option<Arc<dyn std::any::Any + Send + Sync>> {
+        self.registry.get_shared_erased(key)
+    }
+
     fn stop(&self) {
         self.controller.stop();
     }
@@ -606,6 +610,19 @@ mod tests {
             stream_ctx.metadata().get("tenant").map(String::as_str),
             Some("alpha")
         );
+    }
+
+    #[test]
+    fn test_shared_extension_is_visible_through_engine_context() {
+        let mut ctx = Context::new(Input {
+            value: "Hello".to_string(),
+        });
+        ctx.insert("wan_response", 42_u64);
+
+        let stream_ctx = StreamContext::from(ctx);
+        let extension = AsyncEngineContext::get_extension(&stream_ctx, "wan_response")
+            .expect("shared extension must survive the context handoff");
+        assert_eq!(*extension.downcast::<u64>().unwrap(), 42);
     }
 
     #[test]

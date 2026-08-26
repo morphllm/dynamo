@@ -97,6 +97,24 @@ pub use crate::protocols::common::preprocessor::PreprocessedEmbeddingRequest;
 
 use crate::protocols::common::llm_backend::EmbeddingsEngineOutput;
 
+fn prepare_signed_wan_request(
+    request: &NvCreateChatCompletionRequest,
+    original_stream_flag: bool,
+) -> NvCreateChatCompletionRequest {
+    let mut signed_request = request.clone();
+    signed_request.inner.stream = Some(original_stream_flag);
+
+    // `enable_usage_for_nonstreaming` adds stream_options for Dynamo's internal
+    // streaming aggregation. That field is invalid on the regional HTTP hop once
+    // the client-facing stream flag is restored to false. The regional frontend
+    // enables unary usage accounting again after it validates the signed request.
+    if !original_stream_flag {
+        signed_request.inner.stream_options = None;
+    }
+
+    signed_request
+}
+
 fn routing_priorities(hints: Option<&AgentHints>) -> (Option<f64>, Option<u32>, Option<i32>) {
     let priority_jump = hints.and_then(|h| {
         h.priority
@@ -5386,7 +5404,7 @@ impl
         >,
     ) -> Result<ManyOut<Annotated<NvCreateChatCompletionStreamResponse>>, Error> {
         // unpack the request
-        let (mut request, context) = request.into_parts();
+        let (mut request, mut context) = request.into_parts();
 
         // Preserve original inbound streaming flag before any internal overrides
         let request_id = context.id().to_string();
@@ -5457,19 +5475,92 @@ impl
             .await?;
         attach_agent_context_from_context(&mut common_request, &context);
 
-        crate::global_routing_shadow::observe(
-            &common_request.model,
+        let supplied_prompt_token_digest = request
+            .nvext
+            .as_ref()
+            .and_then(|nvext| nvext.prompt_token_digest.as_deref());
+        crate::global_routing_envelope::enforce_prompt_token_digest(
+            supplied_prompt_token_digest,
             &common_request.token_ids,
-            self.kv_cache_block_size,
             &request_id,
-            common_request.multi_modal_data.is_some() || common_request.mm_routing_info.is_some(),
-        );
+        )?;
 
         let uses_tool_call_structural_tag = self.apply_tool_choice_guided_decoding(
             &request,
             &mut common_request,
             prompt_injected_reasoning,
         )?;
+
+        // A valid supplied digest marks the request as already selected and
+        // authenticated by the global router. Execute it in this regional
+        // frontend instead of recursively making another WAN decision.
+        if supplied_prompt_token_digest.is_none()
+            && let Some(decision) = crate::global_routing::decide(
+                &common_request.model,
+                &common_request.token_ids,
+                self.kv_cache_block_size,
+                &request_id,
+                common_request.multi_modal_data.is_some()
+                    || common_request.mm_routing_info.is_some(),
+            )
+            .await
+            .map_err(|error| crate::http::service::error::HttpError {
+                code: 503,
+                message: error.to_string(),
+            })?
+        {
+            let signed_request = prepare_signed_wan_request(&request, original_stream_flag);
+            let normalized_body = serde_json::to_value(&signed_request).map_err(|error| {
+                crate::http::service::error::HttpError {
+                    code: 500,
+                    message: format!("failed to serialize normalized request: {error}"),
+                }
+            })?;
+            let signed = crate::global_routing_envelope::mint_signed_routing_decision(
+                decision,
+                context
+                    .metadata()
+                    .get(crate::global_routing_envelope::TRUSTED_AUTH_METADATA_KEY)
+                    .map(String::as_str),
+                &request_id,
+                "/v1/chat/completions",
+                &common_request.model,
+                normalized_body,
+                &common_request.token_ids,
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+            )
+            .map_err(|error| crate::http::service::error::HttpError {
+                code: 503,
+                message: error.to_string(),
+            })?;
+            let wan_response = crate::global_routing_transport::dispatch_signed(&signed)
+                .await
+                .map_err(|error| crate::http::service::error::HttpError {
+                    code: 502,
+                    message: error.to_string(),
+                })?;
+            context.insert(
+                crate::global_routing_envelope::SIGNED_ENVELOPE_CONTEXT_KEY,
+                signed,
+            );
+            context.insert(
+                crate::global_routing_transport::WAN_RESPONSE_CONTEXT_KEY,
+                crate::global_routing_transport::WanResponseHandle::new(wan_response),
+            );
+
+            // Global routing now owns the request. The HTTP source takes the
+            // live WAN response from context and relays it byte-for-byte. Do
+            // not reach the local `next.generate` call below.
+            return Ok(ResponseStream::new(
+                Box::pin(stream::empty()),
+                Arc::new(dynamo_runtime::pipeline::context::StreamContext::from(
+                    context,
+                )),
+            ));
+        }
 
         tracing::trace!(request = ?common_request, prompt_injected_reasoning, "Pre-processed request");
         let trace_state = crate::request_trace::build_request_end_trace_state(
@@ -5663,13 +5754,14 @@ impl
         Self::validate_preprocessed_token_budget(&common_request, self.token_budget.as_ref())?;
         attach_agent_context_from_context(&mut common_request, &context);
 
-        crate::global_routing_shadow::observe(
-            &common_request.model,
+        crate::global_routing_envelope::enforce_prompt_token_digest(
+            request
+                .nvext
+                .as_ref()
+                .and_then(|nvext| nvext.prompt_token_digest.as_deref()),
             &common_request.token_ids,
-            self.kv_cache_block_size,
             &request_id,
-            common_request.multi_modal_data.is_some() || common_request.mm_routing_info.is_some(),
-        );
+        )?;
 
         let trace_state = crate::request_trace::build_request_end_trace_state(
             &common_request,
@@ -5857,6 +5949,39 @@ mod tests {
         ChatChoiceStream, ChatCompletionStreamResponseDelta, CreateChatCompletionStreamResponse,
         FinishReason, Role,
     };
+
+    #[test]
+    fn test_prepare_signed_wan_request_restores_client_stream_contract() {
+        let mut unary: NvCreateChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "morph-dsv4flash",
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": false
+        }))
+        .unwrap();
+        unary.enable_usage_for_nonstreaming(false);
+        unary.inner.stream = Some(true);
+
+        let signed_unary = prepare_signed_wan_request(&unary, false);
+        assert_eq!(signed_unary.inner.stream, Some(false));
+        assert!(signed_unary.inner.stream_options.is_none());
+
+        let streaming: NvCreateChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "morph-dsv4flash",
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": true,
+            "stream_options": {"include_usage": true}
+        }))
+        .unwrap();
+
+        let signed_streaming = prepare_signed_wan_request(&streaming, true);
+        assert_eq!(signed_streaming.inner.stream, Some(true));
+        assert!(
+            signed_streaming
+                .inner
+                .stream_options
+                .is_some_and(|options| options.include_usage)
+        );
+    }
 
     fn chat_stream_chunk(
         index: u32,
