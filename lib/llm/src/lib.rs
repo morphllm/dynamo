@@ -19,6 +19,7 @@ pub mod fpm_trace;
 pub mod frontend_config;
 pub mod global_routing;
 pub mod global_routing_envelope;
+pub mod global_routing_transport;
 pub mod grpc;
 pub mod http;
 pub mod hub;

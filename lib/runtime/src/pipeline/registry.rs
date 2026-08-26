@@ -67,6 +67,10 @@ impl Registry {
             .ok_or_else(|| format!("Shared key not found: {}", key))
     }
 
+    pub(crate) fn get_shared_erased(&self, key: &str) -> Option<Arc<dyn Any + Send + Sync>> {
+        self.shared_storage.get(key).cloned()
+    }
+
     /// Retrieve an optional shared object from the registry by key and type.
     pub fn get_shared_optional<V: Send + Sync + 'static>(
         &self,

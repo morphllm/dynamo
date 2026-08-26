@@ -5512,10 +5512,30 @@ impl
                 code: 503,
                 message: error.to_string(),
             })?;
+            let wan_response = crate::global_routing_transport::dispatch_signed(&signed)
+                .await
+                .map_err(|error| crate::http::service::error::HttpError {
+                    code: 502,
+                    message: error.to_string(),
+                })?;
             context.insert(
                 crate::global_routing_envelope::SIGNED_ENVELOPE_CONTEXT_KEY,
                 signed,
             );
+            context.insert(
+                crate::global_routing_transport::WAN_RESPONSE_CONTEXT_KEY,
+                crate::global_routing_transport::WanResponseHandle::new(wan_response),
+            );
+
+            // Global routing now owns the request. The HTTP source takes the
+            // live WAN response from context and relays it byte-for-byte. Do
+            // not reach the local `next.generate` call below.
+            return Ok(ResponseStream::new(
+                Box::pin(stream::empty()),
+                Arc::new(dynamo_runtime::pipeline::context::StreamContext::from(
+                    context,
+                )),
+            ));
         }
 
         tracing::trace!(request = ?common_request, prompt_injected_reasoning, "Pre-processed request");
@@ -5759,10 +5779,26 @@ impl
                 code: 503,
                 message: error.to_string(),
             })?;
+            let wan_response = crate::global_routing_transport::dispatch_signed(&signed)
+                .await
+                .map_err(|error| crate::http::service::error::HttpError {
+                    code: 502,
+                    message: error.to_string(),
+                })?;
             context.insert(
                 crate::global_routing_envelope::SIGNED_ENVELOPE_CONTEXT_KEY,
                 signed,
             );
+            context.insert(
+                crate::global_routing_transport::WAN_RESPONSE_CONTEXT_KEY,
+                crate::global_routing_transport::WanResponseHandle::new(wan_response),
+            );
+            return Ok(ResponseStream::new(
+                Box::pin(stream::empty()),
+                Arc::new(dynamo_runtime::pipeline::context::StreamContext::from(
+                    context,
+                )),
+            ));
         }
 
         let trace_state = crate::request_trace::build_request_end_trace_state(

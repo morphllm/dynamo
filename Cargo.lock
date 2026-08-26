@@ -3968,13 +3968,11 @@ dependencies = [
  "clap",
  "dynamo-kv-router",
  "dynamo-llm",
- "reqwest 0.12.28",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
  "tonic 0.13.1",
- "tower 0.5.3",
  "tracing",
  "tracing-subscriber",
 ]

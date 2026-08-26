@@ -118,6 +118,12 @@ pub trait AsyncEngineContext: Send + Sync + Debug {
     /// Unique ID for the Stream
     fn id(&self) -> &str;
 
+    /// Retrieve request-scoped shared state carried by a pipeline context.
+    /// Context implementations without an extension registry return `None`.
+    fn get_extension(&self, _key: &str) -> Option<Arc<dyn Any + Send + Sync>> {
+        None
+    }
+
     /// Returns true if `stop_generating()` has been called; otherwise, false.
     fn is_stopped(&self) -> bool;
 

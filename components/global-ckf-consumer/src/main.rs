@@ -6,7 +6,6 @@ use clap::Parser;
 use global_ckf_consumer::api::{AppState, api_router, system_router};
 use global_ckf_consumer::config::Config;
 use global_ckf_consumer::coordinator;
-use global_ckf_consumer::dispatch::{Dispatcher, dispatch_router};
 use global_ckf_consumer::supervisor::spawn_relay_supervisors;
 
 #[tokio::main]
@@ -21,15 +20,11 @@ async fn main() -> Result<()> {
 
     let events = spawn_relay_supervisors(&config);
     let state = AppState::default();
-    let mut app = api_router(state.clone(), config.max_query_blocks);
-    if let Some(dispatcher) = Dispatcher::from_config(&config, state.clone())? {
-        app = app.merge(dispatch_router(dispatcher));
-    }
     let api = tokio::net::TcpListener::bind(config.listen_address).await?;
     let system = tokio::net::TcpListener::bind(config.metrics_listen_address).await?;
     tokio::select! {
         result = coordinator::run(config.clone(), state.clone(), events) => result?,
-        result = axum::serve(api, app) => result?,
+        result = axum::serve(api, api_router(state.clone(), config.max_query_blocks)) => result?,
         result = axum::serve(system, system_router(state)) => result?,
         _ = tokio::signal::ctrl_c() => {}
     }

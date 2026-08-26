@@ -304,15 +304,6 @@ impl EnvelopeSigner {
         })
     }
 
-    /// Build a signer from raw Ed25519 seed bytes, for keys sourced from a
-    /// secret manager rather than a PEM file.
-    pub fn from_key_bytes(key_id: impl Into<String>, seed: &[u8; 32]) -> Self {
-        Self {
-            key_id: key_id.into(),
-            key: ed25519_dalek::SigningKey::from_bytes(seed),
-        }
-    }
-
     pub fn verifier(&self) -> EnvelopeVerifier {
         EnvelopeVerifier {
             keys: [(self.key_id.clone(), self.key.verifying_key())]
@@ -374,25 +365,6 @@ impl EnvelopeVerifier {
         local_region: &str,
         now_unix_seconds: u64,
     ) -> Result<Envelope, EnvelopeError> {
-        let envelope = self.verify_addressed(wire, now_unix_seconds)?;
-        if envelope.routing.selected_region != local_region {
-            return Err(EnvelopeError::WrongRegion {
-                selected: envelope.routing.selected_region,
-                local: local_region.to_owned(),
-            });
-        }
-        Ok(envelope)
-    }
-
-    /// Verify signature, version, and validity window without asserting the
-    /// verifier is the addressed region. This is the dispatcher's check: it
-    /// forwards to whatever region the envelope selects, so only the target
-    /// region's own verification may enforce addressing.
-    pub fn verify_addressed(
-        &self,
-        wire: &SignedEnvelope,
-        now_unix_seconds: u64,
-    ) -> Result<Envelope, EnvelopeError> {
         use base64::Engine;
 
         let engine = &base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -424,6 +396,12 @@ impl EnvelopeVerifier {
         }
         if now_unix_seconds < envelope.issued_at || now_unix_seconds > envelope.expires_at {
             return Err(EnvelopeError::Expired);
+        }
+        if envelope.routing.selected_region != local_region {
+            return Err(EnvelopeError::WrongRegion {
+                selected: envelope.routing.selected_region,
+                local: local_region.to_owned(),
+            });
         }
         Ok(envelope)
     }
