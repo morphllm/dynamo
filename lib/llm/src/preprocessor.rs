@@ -5457,6 +5457,15 @@ impl
             .await?;
         attach_agent_context_from_context(&mut common_request, &context);
 
+        crate::global_routing_envelope::enforce_prompt_token_digest(
+            request
+                .nvext
+                .as_ref()
+                .and_then(|nvext| nvext.prompt_token_digest.as_deref()),
+            &common_request.token_ids,
+            &request_id,
+        )?;
+
         crate::global_routing_shadow::observe(
             &common_request.model,
             &common_request.token_ids,
@@ -5662,6 +5671,15 @@ impl
         let mut common_request = builder.build()?;
         Self::validate_preprocessed_token_budget(&common_request, self.token_budget.as_ref())?;
         attach_agent_context_from_context(&mut common_request, &context);
+
+        crate::global_routing_envelope::enforce_prompt_token_digest(
+            request
+                .nvext
+                .as_ref()
+                .and_then(|nvext| nvext.prompt_token_digest.as_deref()),
+            &common_request.token_ids,
+            &request_id,
+        )?;
 
         crate::global_routing_shadow::observe(
             &common_request.model,

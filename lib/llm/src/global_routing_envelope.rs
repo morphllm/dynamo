@@ -27,6 +27,9 @@
 //! from its own native preprocessing and rejects any mismatch, so a request
 //! can never be routed with one token sequence and executed with another.
 
+use std::sync::LazyLock;
+
+use prometheus::{IntCounterVec, Opts, Registry};
 use serde::{Deserialize, Serialize};
 
 use crate::protocols::TokenIdType;
@@ -214,6 +217,57 @@ impl EnvelopeVerifier {
     }
 }
 
+static EXECUTE_EXACT: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    IntCounterVec::new(
+        Opts::new(
+            "morph_global_routing_execute_exact_total",
+            "Execute-exact digest comparisons on globally routed requests.",
+        ),
+        &["outcome"],
+    )
+    .expect("static metric options are valid")
+});
+
+/// Register this module's frontend-side collectors.
+pub fn ensure_metrics_registered_prometheus(registry: &Registry) -> Result<(), prometheus::Error> {
+    registry.register(Box::new(EXECUTE_EXACT.clone()))
+}
+
+/// Enforce the execute-exact contract on the serving frontend.
+///
+/// `expected` is `nvext.prompt_token_digest`, stamped by the regional pod
+/// proxy from the signed routing envelope. A mismatch means the frontend's
+/// preprocessing produced a different token sequence than the one that drove
+/// the routing decision — normalization drift between global processing and
+/// this frontend — and the request must be rejected, never served.
+pub fn enforce_prompt_token_digest(
+    expected: Option<&str>,
+    token_ids: &[TokenIdType],
+    request_id: &str,
+) -> Result<(), crate::http::service::error::HttpError> {
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    let executed = prompt_token_digest(token_ids);
+    if executed == expected {
+        EXECUTE_EXACT.with_label_values(&["match"]).inc();
+        return Ok(());
+    }
+    EXECUTE_EXACT.with_label_values(&["mismatch"]).inc();
+    tracing::warn!(
+        request_id,
+        expected,
+        executed,
+        token_count = token_ids.len(),
+        "execute-exact violation: routed and executed token sequences differ"
+    );
+    Err(crate::http::service::error::HttpError {
+        code: 409,
+        message: "prompt token digest mismatch: the routed and executed token sequences differ"
+            .to_string(),
+    })
+}
+
 /// Digest of the exact native token sequence, as `blake3:<hex>`.
 ///
 /// Domain separated and length prefixed; token ids are hashed as little
@@ -359,6 +413,20 @@ mod tests {
             verifier.verify("env2.a.b", "us-east5-financial", now),
             Err(EnvelopeError::Malformed)
         );
+    }
+
+    #[test]
+    fn execute_exact_enforces_only_when_a_digest_is_expected() {
+        let tokens = [1, 2, 3, 4];
+        assert!(enforce_prompt_token_digest(None, &tokens, "req").is_ok());
+        assert!(
+            enforce_prompt_token_digest(Some(&prompt_token_digest(&tokens)), &tokens, "req")
+                .is_ok()
+        );
+        let error =
+            enforce_prompt_token_digest(Some(&prompt_token_digest(&[9])), &tokens, "req")
+                .unwrap_err();
+        assert_eq!(error.code, 409);
     }
 
     #[test]

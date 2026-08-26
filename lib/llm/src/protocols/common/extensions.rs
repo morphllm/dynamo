@@ -249,6 +249,16 @@ pub struct NvExt {
     #[builder(default, setter(strip_option))]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub router: Option<RouterParams>,
+
+    /// Execute-exact contract for globally routed requests: the expected
+    /// native prompt token digest from the signed routing envelope, stamped
+    /// by the regional pod proxy. After preprocessing, the frontend must
+    /// reproduce this digest from its own token sequence or reject the
+    /// request, so a request can never be routed with one prompt and
+    /// executed with another.
+    #[builder(default, setter(strip_option, into))]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_token_digest: Option<String>,
 }
 
 impl Default for NvExt {
@@ -290,6 +300,7 @@ impl NvExt {
             request_timestamp_ms,
             routing_constraints,
             router,
+            prompt_token_digest,
         } = self;
 
         greed_sampling.is_some()
@@ -308,6 +319,7 @@ impl NvExt {
             || request_timestamp_ms.is_some()
             || routing_constraints.is_some()
             || router.is_some()
+            || prompt_token_digest.is_some()
     }
 }
 
