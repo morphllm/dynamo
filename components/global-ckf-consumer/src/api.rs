@@ -411,6 +411,7 @@ async fn token_decision(
         &request.model,
         request.role,
         &hashes,
+        request.token_ids.len() as u64,
         request.block_size,
         request.local_dc,
         request.stable_tie_key,
@@ -475,6 +476,7 @@ pub(crate) fn evaluate_decision(
     model: &str,
     role: QueryRole,
     hashes: &[u64],
+    request_token_count: u64,
     block_size: u32,
     local_dc: u64,
     stable_tie_key: u64,
@@ -489,7 +491,7 @@ pub(crate) fn evaluate_decision(
     }
     let input = PolicyInput {
         local_dc: dynamo_kv_router::identity::DcId::new(local_dc),
-        query_block_count: hashes.len() as u64,
+        query_token_count: request_token_count,
         native_block_size_tokens: block_size as u64,
         stable_tie_key,
     };
@@ -600,11 +602,6 @@ fn native_hashes(
     } else {
         request.token_ids.len() / stride
     };
-    if block_count == 0 && !request.token_ids.is_empty() {
-        return Err(ApiError::bad_request(
-            "token_ids does not contain one complete native block",
-        ));
-    }
     if block_count > max_query_blocks {
         return Err(ApiError::payload_too_large(
             "token_ids exceeds the configured block limit",
@@ -885,6 +882,17 @@ mod tests {
             native_hashes(&request, 8).unwrap(),
             expected.into_iter().map(|hash| hash.0).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn token_contract_accepts_a_partial_first_block() {
+        let mut request = request();
+        request.token_ids = vec![1, 2, 3];
+        request.block_size = 256;
+        request.block_mm_infos = None;
+        request.is_eagle = None;
+
+        assert!(native_hashes(&request, 8).unwrap().is_empty());
     }
 
     #[test]
