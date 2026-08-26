@@ -75,6 +75,23 @@ pub struct Metrics {
     decisions_remote: AtomicU64,
     decisions_none: AtomicU64,
     decision_errors: AtomicU64,
+    dispatches: AtomicU64,
+    dispatch_rejects: AtomicU64,
+    dispatch_failures: AtomicU64,
+}
+
+impl Metrics {
+    pub(crate) fn note_dispatch(&self) {
+        self.dispatches.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn note_dispatch_reject(&self) {
+        self.dispatch_rejects.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn note_dispatch_failure(&self) {
+        self.dispatch_failures.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 #[derive(Clone, Default)]
@@ -805,7 +822,13 @@ async fn metrics(State(state): State<AppState>) -> String {
             "global_ckf_consumer_decisions_total{{outcome=\"remote\"}} {}\n",
             "global_ckf_consumer_decisions_total{{outcome=\"none\"}} {}\n",
             "# TYPE global_ckf_consumer_decision_errors_total counter\n",
-            "global_ckf_consumer_decision_errors_total {}\n"
+            "global_ckf_consumer_decision_errors_total {}\n",
+            "# TYPE global_ckf_consumer_dispatches_total counter\n",
+            "global_ckf_consumer_dispatches_total {}\n",
+            "# TYPE global_ckf_consumer_dispatch_rejects_total counter\n",
+            "global_ckf_consumer_dispatch_rejects_total {}\n",
+            "# TYPE global_ckf_consumer_dispatch_failures_total counter\n",
+            "global_ckf_consumer_dispatch_failures_total {}\n"
         ),
         ready,
         state.metrics.queries.load(Ordering::Relaxed),
@@ -816,6 +839,9 @@ async fn metrics(State(state): State<AppState>) -> String {
         state.metrics.decisions_remote.load(Ordering::Relaxed),
         state.metrics.decisions_none.load(Ordering::Relaxed),
         state.metrics.decision_errors.load(Ordering::Relaxed),
+        state.metrics.dispatches.load(Ordering::Relaxed),
+        state.metrics.dispatch_rejects.load(Ordering::Relaxed),
+        state.metrics.dispatch_failures.load(Ordering::Relaxed),
     )
 }
 
