@@ -128,10 +128,11 @@ fn take_global_wan_response(
 }
 
 fn relay_global_wan_response(
-    response: crate::global_routing_transport::WanResponse,
+    mut response: crate::global_routing_transport::WanResponse,
     inflight_guard: super::metrics::InflightGuard,
     http_queue_guard: super::metrics::HttpQueueGuard,
 ) -> Result<Response, ErrorResponse> {
+    crate::global_routing_transport::sanitize_response_headers(&mut response.headers);
     let successful_status = response.status.is_success();
     let body = async_stream::stream! {
         let mut body = response.body;
@@ -998,10 +999,6 @@ async fn completions_single(
 
     // capture the context to cancel the stream if the client disconnects
     let ctx = stream.context();
-
-    if let Some(response) = take_global_wan_response(&ctx, &request_id)? {
-        return relay_global_wan_response(response, inflight_guard, http_queue_guard);
-    }
 
     let annotations = annotations.map_or(Vec::new(), |annotations| {
         annotations

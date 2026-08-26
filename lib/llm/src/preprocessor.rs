@@ -5457,11 +5457,12 @@ impl
             .await?;
         attach_agent_context_from_context(&mut common_request, &context);
 
+        let supplied_prompt_token_digest = request
+            .nvext
+            .as_ref()
+            .and_then(|nvext| nvext.prompt_token_digest.as_deref());
         crate::global_routing_envelope::enforce_prompt_token_digest(
-            request
-                .nvext
-                .as_ref()
-                .and_then(|nvext| nvext.prompt_token_digest.as_deref()),
+            supplied_prompt_token_digest,
             &common_request.token_ids,
             &request_id,
         )?;
@@ -5472,18 +5473,24 @@ impl
             prompt_injected_reasoning,
         )?;
 
-        if let Some(decision) = crate::global_routing::decide(
-            &common_request.model,
-            &common_request.token_ids,
-            self.kv_cache_block_size,
-            &request_id,
-            common_request.multi_modal_data.is_some() || common_request.mm_routing_info.is_some(),
-        )
-        .await
-        .map_err(|error| crate::http::service::error::HttpError {
-            code: 503,
-            message: error.to_string(),
-        })? {
+        // A valid supplied digest marks the request as already selected and
+        // authenticated by the global router. Execute it in this regional
+        // frontend instead of recursively making another WAN decision.
+        if supplied_prompt_token_digest.is_none()
+            && let Some(decision) = crate::global_routing::decide(
+                &common_request.model,
+                &common_request.token_ids,
+                self.kv_cache_block_size,
+                &request_id,
+                common_request.multi_modal_data.is_some()
+                    || common_request.mm_routing_info.is_some(),
+            )
+            .await
+            .map_err(|error| crate::http::service::error::HttpError {
+                code: 503,
+                message: error.to_string(),
+            })?
+        {
             let mut signed_request = request.clone();
             signed_request.inner.stream = Some(original_stream_flag);
             let normalized_body = serde_json::to_value(&signed_request).map_err(|error| {
@@ -5675,7 +5682,7 @@ impl
         let _stage_guard = StageGuard::new(STAGE_PREPROCESS, "");
 
         // unpack the request
-        let (mut request, mut context) = request.into_parts();
+        let (mut request, context) = request.into_parts();
         let request_id = context.id().to_string();
 
         // Preserve original streaming flag
@@ -5738,68 +5745,6 @@ impl
             &common_request.token_ids,
             &request_id,
         )?;
-
-        if let Some(decision) = crate::global_routing::decide(
-            &common_request.model,
-            &common_request.token_ids,
-            self.kv_cache_block_size,
-            &request_id,
-            common_request.multi_modal_data.is_some() || common_request.mm_routing_info.is_some(),
-        )
-        .await
-        .map_err(|error| crate::http::service::error::HttpError {
-            code: 503,
-            message: error.to_string(),
-        })? {
-            let mut signed_request = request.clone();
-            signed_request.inner.stream = Some(original_stream_flag);
-            let normalized_body = serde_json::to_value(&signed_request).map_err(|error| {
-                crate::http::service::error::HttpError {
-                    code: 500,
-                    message: format!("failed to serialize normalized request: {error}"),
-                }
-            })?;
-            let signed = crate::global_routing_envelope::mint_signed_routing_decision(
-                decision,
-                context
-                    .metadata()
-                    .get(crate::global_routing_envelope::TRUSTED_AUTH_METADATA_KEY)
-                    .map(String::as_str),
-                &request_id,
-                "/v1/completions",
-                &common_request.model,
-                normalized_body,
-                &common_request.token_ids,
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs(),
-            )
-            .map_err(|error| crate::http::service::error::HttpError {
-                code: 503,
-                message: error.to_string(),
-            })?;
-            let wan_response = crate::global_routing_transport::dispatch_signed(&signed)
-                .await
-                .map_err(|error| crate::http::service::error::HttpError {
-                    code: 502,
-                    message: error.to_string(),
-                })?;
-            context.insert(
-                crate::global_routing_envelope::SIGNED_ENVELOPE_CONTEXT_KEY,
-                signed,
-            );
-            context.insert(
-                crate::global_routing_transport::WAN_RESPONSE_CONTEXT_KEY,
-                crate::global_routing_transport::WanResponseHandle::new(wan_response),
-            );
-            return Ok(ResponseStream::new(
-                Box::pin(stream::empty()),
-                Arc::new(dynamo_runtime::pipeline::context::StreamContext::from(
-                    context,
-                )),
-            ));
-        }
 
         let trace_state = crate::request_trace::build_request_end_trace_state(
             &common_request,

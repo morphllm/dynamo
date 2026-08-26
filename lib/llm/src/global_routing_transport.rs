@@ -9,12 +9,13 @@
 
 use std::collections::BTreeMap;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 
 use async_trait::async_trait;
 use base64::Engine;
 use bytes::Bytes;
-use futures::{Stream, TryStreamExt};
+use futures::Stream;
+use prometheus::{IntCounterVec, Opts, Registry};
 use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde::de::{MapAccess, Visitor};
 use url::Url;
@@ -55,7 +56,89 @@ impl WanResponseHandle {
 
 pub const WAN_RESPONSE_CONTEXT_KEY: &str = "global_routing.wan_response";
 
+/// Remove headers that describe the regional HTTP hop rather than the outer
+/// client response. `Connection` may nominate additional hop-scoped fields.
+pub fn sanitize_response_headers(headers: &mut HeaderMap) {
+    let connection_scoped = headers
+        .get_all("connection")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    for name in connection_scoped {
+        headers.remove(name);
+    }
+    for name in [
+        "connection",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+        // The outer Hyper response computes framing for its streaming body.
+        "content-length",
+    ] {
+        headers.remove(name);
+    }
+}
+
 static DISPATCHER: OnceLock<Result<RegionalDispatcher, String>> = OnceLock::new();
+
+static WAN_ATTEMPTS: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    IntCounterVec::new(
+        Opts::new(
+            "morph_global_routing_wan_attempts_total",
+            "Authoritative WAN dispatch attempts by selected region.",
+        ),
+        &["selected_region"],
+    )
+    .expect("static metric options are valid")
+});
+
+static WAN_OUTCOMES: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    IntCounterVec::new(
+        Opts::new(
+            "morph_global_routing_wan_outcomes_total",
+            "WAN transport outcomes by selected region and bounded phase.",
+        ),
+        &["selected_region", "phase", "outcome"],
+    )
+    .expect("static metric options are valid")
+});
+
+static WAN_RESPONSE_STATUS: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    IntCounterVec::new(
+        Opts::new(
+            "morph_global_routing_wan_response_status_total",
+            "Regional pod proxy HTTP response statuses.",
+        ),
+        &["selected_region", "status"],
+    )
+    .expect("static metric options are valid")
+});
+
+static WAN_BYTES: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    IntCounterVec::new(
+        Opts::new(
+            "morph_global_routing_wan_bytes_relayed_total",
+            "Response bytes relayed from regional pod proxies.",
+        ),
+        &["selected_region"],
+    )
+    .expect("static metric options are valid")
+});
+
+pub fn ensure_metrics_registered_prometheus(registry: &Registry) -> Result<(), prometheus::Error> {
+    registry.register(Box::new(WAN_ATTEMPTS.clone()))?;
+    registry.register(Box::new(WAN_OUTCOMES.clone()))?;
+    registry.register(Box::new(WAN_RESPONSE_STATUS.clone()))?;
+    registry.register(Box::new(WAN_BYTES.clone()))
+}
 
 #[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
 pub enum DispatchError {
@@ -213,6 +296,8 @@ impl RegionalTransport for Http2Transport {
         let request_id =
             HeaderValue::from_str(request_id).map_err(|_| DispatchError::MalformedEnvelope)?;
 
+        WAN_ATTEMPTS.with_label_values(&[region]).inc();
+
         // One send, one selected region. reqwest does not retry requests.
         let response = self
             .client
@@ -223,17 +308,89 @@ impl RegionalTransport for Http2Transport {
             .json(envelope)
             .send()
             .await
-            .map_err(|error| DispatchError::BeforeResponse(error.to_string()))?;
+            .map_err(|error| {
+                WAN_OUTCOMES
+                    .with_label_values(&[region, "before_response", "failure"])
+                    .inc();
+                DispatchError::BeforeResponse(error.to_string())
+            })?;
         let status = response.status();
         let headers = response.headers().clone();
-        let body = response
-            .bytes_stream()
-            .map_err(|error| DispatchError::Midstream(error.to_string()));
+        WAN_RESPONSE_STATUS
+            .with_label_values(&[region, &status.as_u16().to_string()])
+            .inc();
+        WAN_OUTCOMES
+            .with_label_values(&[region, "response", "received"])
+            .inc();
+        let body =
+            InstrumentedResponseBody::new(region.to_owned(), Box::pin(response.bytes_stream()));
         Ok(WanResponse {
             status,
             headers,
             body: Box::pin(body),
         })
+    }
+}
+
+struct InstrumentedResponseBody {
+    selected_region: String,
+    inner: Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>,
+    terminal: bool,
+}
+
+impl InstrumentedResponseBody {
+    fn new(
+        selected_region: String,
+        inner: Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>,
+    ) -> Self {
+        Self {
+            selected_region,
+            inner,
+            terminal: false,
+        }
+    }
+}
+
+impl Stream for InstrumentedResponseBody {
+    type Item = Result<Bytes, DispatchError>;
+
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        match self.inner.as_mut().poll_next(cx) {
+            std::task::Poll::Ready(Some(Ok(bytes))) => {
+                WAN_BYTES
+                    .with_label_values(&[&self.selected_region])
+                    .inc_by(bytes.len() as u64);
+                std::task::Poll::Ready(Some(Ok(bytes)))
+            }
+            std::task::Poll::Ready(Some(Err(error))) => {
+                WAN_OUTCOMES
+                    .with_label_values(&[&self.selected_region, "stream", "failure"])
+                    .inc();
+                self.terminal = true;
+                std::task::Poll::Ready(Some(Err(DispatchError::Midstream(error.to_string()))))
+            }
+            std::task::Poll::Ready(None) => {
+                WAN_OUTCOMES
+                    .with_label_values(&[&self.selected_region, "stream", "complete"])
+                    .inc();
+                self.terminal = true;
+                std::task::Poll::Ready(None)
+            }
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    }
+}
+
+impl Drop for InstrumentedResponseBody {
+    fn drop(&mut self) {
+        if !self.terminal {
+            WAN_OUTCOMES
+                .with_label_values(&[&self.selected_region, "stream", "cancelled"])
+                .inc();
+        }
     }
 }
 
@@ -584,18 +741,79 @@ mod tests {
     }
 
     #[test]
+    fn response_headers_drop_hop_and_framing_state() {
+        let mut headers = HeaderMap::new();
+        headers.insert("connection", HeaderValue::from_static("x-hop, keep-alive"));
+        headers.insert("x-hop", HeaderValue::from_static("private"));
+        headers.insert("keep-alive", HeaderValue::from_static("timeout=5"));
+        headers.insert("transfer-encoding", HeaderValue::from_static("chunked"));
+        headers.insert("content-length", HeaderValue::from_static("123"));
+        headers.insert(
+            "content-type",
+            HeaderValue::from_static("text/event-stream"),
+        );
+
+        sanitize_response_headers(&mut headers);
+
+        assert!(!headers.contains_key("connection"));
+        assert!(!headers.contains_key("x-hop"));
+        assert!(!headers.contains_key("keep-alive"));
+        assert!(!headers.contains_key("transfer-encoding"));
+        assert!(!headers.contains_key("content-length"));
+        assert_eq!(headers["content-type"], "text/event-stream");
+    }
+
+    #[test]
+    fn wan_metrics_register_with_bounded_label_contracts() {
+        let registry = Registry::new();
+        ensure_metrics_registered_prometheus(&registry).unwrap();
+        WAN_ATTEMPTS.with_label_values(&["test-region"]).inc();
+        WAN_OUTCOMES
+            .with_label_values(&["test-region", "stream", "complete"])
+            .inc();
+        WAN_RESPONSE_STATUS
+            .with_label_values(&["test-region", "200"])
+            .inc();
+        WAN_BYTES.with_label_values(&["test-region"]).inc();
+        let names = registry
+            .gather()
+            .into_iter()
+            .map(|family| family.name().to_owned())
+            .collect::<Vec<_>>();
+        for expected in [
+            "morph_global_routing_wan_attempts_total",
+            "morph_global_routing_wan_outcomes_total",
+            "morph_global_routing_wan_response_status_total",
+            "morph_global_routing_wan_bytes_relayed_total",
+        ] {
+            assert!(
+                names.iter().any(|name| name == expected),
+                "missing {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn dropping_live_stream_records_observable_cancellation() {
+        let counter = WAN_OUTCOMES.with_label_values(&["cancel-test", "stream", "cancelled"]);
+        let before = counter.get();
+        let never_polled = stream::pending::<Result<Bytes, reqwest::Error>>();
+        drop(InstrumentedResponseBody::new(
+            "cancel-test".to_owned(),
+            Box::pin(never_polled),
+        ));
+        assert_eq!(counter.get(), before + 1);
+    }
+
+    #[test]
     fn production_call_graph_returns_wan_ownership_before_local_generate() {
         let preprocessor = include_str!("preprocessor.rs");
         let dispatch_sites = preprocessor
             .match_indices("global_routing_transport::dispatch_signed(&signed)")
             .map(|(offset, _)| offset)
             .collect::<Vec<_>>();
-        assert_eq!(
-            dispatch_sites.len(),
-            2,
-            "chat and completion must both dispatch"
-        );
-        for dispatch in dispatch_sites {
+        assert_eq!(dispatch_sites.len(), 1, "only chat may dispatch over WAN");
+        for &dispatch in &dispatch_sites {
             let tail = &preprocessor[dispatch..];
             let owned_return = tail
                 .find("return Ok(ResponseStream::new")
@@ -614,8 +832,24 @@ mod tests {
             http_source
                 .matches("take_global_wan_response(&ctx, &request_id)?")
                 .count(),
-            2,
-            "both public OpenAI sources must consume the live WAN response"
+            1,
+            "only the chat source may consume a WAN response"
+        );
+
+        assert!(
+            !preprocessor.contains("\"/v1/completions\",\n                &common_request.model"),
+            "legacy completions must not own WAN dispatch"
+        );
+        assert!(
+            preprocessor.contains("if supplied_prompt_token_digest.is_none()"),
+            "a selected regional request must skip the second global decision"
+        );
+        let ownership_guard = preprocessor
+            .find("if supplied_prompt_token_digest.is_none()")
+            .unwrap();
+        assert!(
+            ownership_guard < dispatch_sites[0],
+            "the sole WAN dispatch must be inside the unselected request guard"
         );
     }
 }
