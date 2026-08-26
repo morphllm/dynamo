@@ -36,7 +36,7 @@ from dynamo.frontend import global_routing as router_module  # noqa: E402
 pytestmark = [pytest.mark.pre_merge, pytest.mark.gpu_0, pytest.mark.unit]
 
 
-def fact(dc, prefix, active, *, ready=True, readiness_age=1, load_age=1, suffix=""):
+def fact(dc, prefix, used, *, capacity=100, ready=True, readiness_age=1, load_age=1, suffix=""):
     return {
         "pool_id": f"pool-{dc}{suffix}",
         "indexer_domain": {},
@@ -45,7 +45,10 @@ def fact(dc, prefix, active, *, ready=True, readiness_age=1, load_age=1, suffix=
         "prefix_depth_blocks": prefix,
         "readiness": [{"canonical_model_id": "model", "state": 2 if ready else 1}],
         "readiness_age_ms": readiness_age,
-        "active_prefill_tokens": active,
+        "kv_used_blocks": used,
+        "total_kv_blocks": capacity,
+        "kv_observed_ranks": 1,
+        "kv_expected_ranks": 1,
         "load_age_ms": load_age,
     }
 
@@ -63,14 +66,18 @@ def select(pools, **overrides):
     return select_pool({"model": "model", "query_blocks": 10, "pools": pools}, **args)
 
 
-def test_exact_prefix_and_load_choose_least_expected_prefill_work():
-    assert select([fact(1, 9, 0), fact(2, 10, 255)]).target_dc == 2
-    assert select([fact(1, 10, 600), fact(2, 9, 0)]).target_dc == 2
+def test_exact_prefix_precedes_authoritative_kv_occupancy():
+    assert select([fact(1, 9, 0), fact(2, 10, 99)]).target_dc == 2
+    assert select([fact(1, 10, 60), fact(2, 9, 0)]).target_dc == 1
+
+
+def test_equal_prefix_uses_normalized_kv_occupancy():
+    assert select([fact(1, 10, 60), fact(2, 10, 100, capacity=200)]).target_dc == 2
 
 
 def test_stale_missing_and_unready_facts_fail_closed():
     missing = fact(1, 10, 0)
-    missing["active_prefill_tokens"] = None
+    missing["kv_used_blocks"] = None
     assert select([missing, fact(2, 10, 0, load_age=6)]) is None
     assert (
         select([fact(1, 10, 0, readiness_age=6), fact(2, 10, 0, ready=False)]) is None
@@ -78,7 +85,7 @@ def test_stale_missing_and_unready_facts_fail_closed():
 
 
 def test_local_wins_equal_work_and_remote_requires_gateway():
-    assert select([fact(2, 9, 256), fact(1, 10, 512)]).target_dc == 1
+    assert select([fact(2, 10, 50), fact(1, 10, 50)]).target_dc == 1
     with pytest.raises(ValueError, match="no gateway"):
         select([fact(2, 10, 0)], gateways={})
 

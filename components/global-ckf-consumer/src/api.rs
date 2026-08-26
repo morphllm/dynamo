@@ -42,9 +42,8 @@ pub struct PoolSignals {
     pub load_updated: Option<Instant>,
     pub kv_used_blocks: Option<u64>,
     pub total_kv_blocks: Option<u64>,
-    pub active_decode_blocks: Option<u64>,
-    pub active_prefill_tokens: Option<u64>,
-    pub prefill_token_capacity: Option<u64>,
+    pub kv_observed_ranks: Option<u32>,
+    pub kv_expected_ranks: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -250,9 +249,8 @@ struct PoolFact {
     load_age_ms: Option<u64>,
     kv_used_blocks: Option<u64>,
     total_kv_blocks: Option<u64>,
-    active_decode_blocks: Option<u64>,
-    active_prefill_tokens: Option<u64>,
-    prefill_token_capacity: Option<u64>,
+    kv_observed_ranks: Option<u32>,
+    kv_expected_ranks: Option<u32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -524,9 +522,8 @@ fn collect_facts(
                     .map(|updated| duration_millis(now.saturating_duration_since(updated))),
                 kv_used_blocks: signal.kv_used_blocks,
                 total_kv_blocks: signal.total_kv_blocks,
-                active_decode_blocks: signal.active_decode_blocks,
-                active_prefill_tokens: signal.active_prefill_tokens,
-                prefill_token_capacity: signal.prefill_token_capacity,
+                kv_observed_ranks: signal.kv_observed_ranks,
+                kv_expected_ranks: signal.kv_expected_ranks,
             });
         }
     }

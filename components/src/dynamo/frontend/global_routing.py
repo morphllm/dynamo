@@ -11,6 +11,7 @@ import json
 import os
 import secrets
 import time
+from fractions import Fraction
 from dataclasses import dataclass
 from typing import Any, AsyncGenerator, AsyncIterator
 
@@ -159,7 +160,7 @@ def select_pool(
     load_max_age_ms: int,
     gateways: dict[str, str],
 ) -> PoolRoute | None:
-    """Select the fresh ready pool with the least expected prefill work."""
+    """Select by exact uncached work, then authoritative KV occupancy."""
 
     query_blocks = _u64(payload["query_blocks"])
     candidates: list[tuple[tuple[Any, ...], PoolRoute]] = []
@@ -179,30 +180,50 @@ def select_pool(
             or not any(item.get("state") == _READY for item in readiness)
         ):
             continue
-        active = pool.get("active_prefill_tokens")
+        used = pool.get("kv_used_blocks")
+        capacity = pool.get("total_kv_blocks")
+        observed_ranks = pool.get("kv_observed_ranks")
+        expected_ranks = pool.get("kv_expected_ranks")
         load_age = pool.get("load_age_ms")
         prefix = pool.get("prefix_depth_blocks")
         if (
-            active is None
+            used is None
+            or capacity is None
+            or observed_ranks is None
+            or expected_ranks is None
             or load_age is None
             or _u64(load_age) > load_max_age_ms
             or prefix is None
         ):
             continue
+        used = _u64(used)
+        capacity = _u64(capacity)
+        observed_ranks = _u64(observed_ranks)
+        expected_ranks = _u64(expected_ranks)
+        if capacity == 0 or expected_ranks == 0 or observed_ranks != expected_ranks:
+            continue
         prefix = _u64(prefix)
         if prefix > query_blocks:
             continue
-        total = _checked_add(
-            _checked_mul(query_blocks - prefix, block_size), _u64(active)
-        )
+        uncached = _checked_mul(query_blocks - prefix, block_size)
         dc = _u64(pool["dc_id"])
         pool_id = str(pool["pool_id"])
         route = PoolRoute(
-            pool_id, dc, gateways.get(pool_id, gateways.get(str(dc), "")), total, prefix
+            pool_id,
+            dc,
+            gateways.get(pool_id, gateways.get(str(dc), "")),
+            uncached,
+            prefix,
         )
         candidates.append(
             (
-                (total, dc != local_dc, _stable_rank(stable_tie_key, pool), pool_id),
+                (
+                    uncached,
+                    Fraction(used, capacity),
+                    dc != local_dc,
+                    _stable_rank(stable_tie_key, pool),
+                    pool_id,
+                ),
                 route,
             )
         )

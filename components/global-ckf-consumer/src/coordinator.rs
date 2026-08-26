@@ -146,6 +146,8 @@ fn collect_signals(fleet: &FleetState) -> HashMap<PoolId, PoolSignals> {
             signal.load_updated = state.load_updated;
             signal.kv_used_blocks = Some(entry.kv_used_blocks);
             signal.total_kv_blocks = Some(entry.total_kv_blocks);
+            signal.kv_observed_ranks = Some(entry.kv_observed_ranks);
+            signal.kv_expected_ranks = Some(entry.kv_expected_ranks);
         }
     }
     signals

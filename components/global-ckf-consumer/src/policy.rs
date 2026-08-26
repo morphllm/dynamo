@@ -24,8 +24,11 @@ pub struct ReadinessFact {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct LoadFact {
-    pub active_prefill_tokens: u64,
+pub struct OccupancyFact {
+    pub used_blocks: u64,
+    pub total_blocks: u64,
+    pub observed_ranks: u32,
+    pub expected_ranks: u32,
     pub freshness: Freshness,
 }
 
@@ -42,7 +45,7 @@ pub struct PoolFacts {
     pub lane: LaneFact,
     pub matched_prefix_blocks: u64,
     pub readiness: Option<ReadinessFact>,
-    pub load: Option<LoadFact>,
+    pub occupancy: Option<OccupancyFact>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,8 +63,9 @@ pub enum IneligibleReason {
     ReadinessMissing,
     ReadinessStale,
     NotReady,
-    LoadMissing,
-    LoadStale,
+    OccupancyMissing,
+    OccupancyStale,
+    OccupancyIncomplete,
     PrefixExceedsQuery,
 }
 
@@ -70,8 +74,8 @@ pub struct EligiblePool {
     pub pool_id: PoolId,
     pub matched_prefix_blocks: u64,
     pub uncached_prefill_tokens: u64,
-    pub active_prefill_tokens: u64,
-    pub total_prefill_tokens: u64,
+    pub used_blocks: u64,
+    pub total_blocks: u64,
     pub local: bool,
     pub stable_rank: u64,
 }
@@ -120,7 +124,7 @@ pub fn select_pool(
             }),
         }
     }
-    eligible.sort_by_key(candidate_order);
+    eligible.sort_by(candidate_order);
     ineligible.sort_by_key(|pool| (pool.reason, pool.pool_id));
     Ok(PolicyDecision {
         selected: eligible.first().copied(),
@@ -142,9 +146,18 @@ fn evaluate_pool(
                 Some(IneligibleReason::ReadinessStale)
             }
             Some(readiness) if !readiness.ready => Some(IneligibleReason::NotReady),
-            Some(_) => match facts.load {
-                None => Some(IneligibleReason::LoadMissing),
-                Some(load) if !load.freshness.is_fresh() => Some(IneligibleReason::LoadStale),
+            Some(_) => match facts.occupancy {
+                None => Some(IneligibleReason::OccupancyMissing),
+                Some(occupancy) if !occupancy.freshness.is_fresh() => {
+                    Some(IneligibleReason::OccupancyStale)
+                }
+                Some(occupancy)
+                    if occupancy.total_blocks == 0
+                        || occupancy.expected_ranks == 0
+                        || occupancy.observed_ranks != occupancy.expected_ranks =>
+                {
+                    Some(IneligibleReason::OccupancyIncomplete)
+                }
                 Some(_) if facts.matched_prefix_blocks > input.query_block_count => {
                     Some(IneligibleReason::PrefixExceedsQuery)
                 }
@@ -156,15 +169,10 @@ fn evaluate_pool(
         return Ok(Err(reason));
     }
 
-    let load = facts.load.expect("eligible pool has load");
+    let occupancy = facts.occupancy.expect("eligible pool has occupancy");
     let uncached_blocks = input.query_block_count - facts.matched_prefix_blocks;
     let uncached_prefill_tokens = uncached_blocks
         .checked_mul(input.native_block_size_tokens)
-        .ok_or(PolicyError::TokenArithmeticOverflow {
-            pool_id: facts.pool_id,
-        })?;
-    let total_prefill_tokens = uncached_prefill_tokens
-        .checked_add(load.active_prefill_tokens)
         .ok_or(PolicyError::TokenArithmeticOverflow {
             pool_id: facts.pool_id,
         })?;
@@ -172,20 +180,23 @@ fn evaluate_pool(
         pool_id: facts.pool_id,
         matched_prefix_blocks: facts.matched_prefix_blocks,
         uncached_prefill_tokens,
-        active_prefill_tokens: load.active_prefill_tokens,
-        total_prefill_tokens,
+        used_blocks: occupancy.used_blocks,
+        total_blocks: occupancy.total_blocks,
         local: facts.pool_id.dc_id() == input.local_dc,
         stable_rank: stable_pool_rank(input.stable_tie_key, facts.pool_id),
     }))
 }
 
-fn candidate_order(candidate: &EligiblePool) -> (u64, bool, u64, PoolId) {
-    (
-        candidate.total_prefill_tokens,
-        !candidate.local,
-        candidate.stable_rank,
-        candidate.pool_id,
-    )
+fn candidate_order(left: &EligiblePool, right: &EligiblePool) -> std::cmp::Ordering {
+    left.uncached_prefill_tokens
+        .cmp(&right.uncached_prefill_tokens)
+        .then_with(|| {
+            (u128::from(left.used_blocks) * u128::from(right.total_blocks))
+                .cmp(&(u128::from(right.used_blocks) * u128::from(left.total_blocks)))
+        })
+        .then_with(|| (!left.local).cmp(&(!right.local)))
+        .then_with(|| left.stable_rank.cmp(&right.stable_rank))
+        .then_with(|| left.pool_id.cmp(&right.pool_id))
 }
 
 fn stable_pool_rank(key: u64, pool_id: PoolId) -> u64 {
@@ -247,7 +258,7 @@ mod tests {
         }
     }
 
-    fn facts(dc: u64, prefix: u64, active: u64) -> PoolFacts {
+    fn facts(dc: u64, prefix: u64, used: u64) -> PoolFacts {
         PoolFacts {
             pool_id: pool(dc),
             lane: LaneFact::Available,
@@ -256,8 +267,11 @@ mod tests {
                 ready: true,
                 freshness: FRESH,
             }),
-            load: Some(LoadFact {
-                active_prefill_tokens: active,
+            occupancy: Some(OccupancyFact {
+                used_blocks: used,
+                total_blocks: 100,
+                observed_ranks: 1,
+                expected_ranks: 1,
                 freshness: FRESH,
             }),
         }
@@ -272,11 +286,11 @@ mod tests {
     }
 
     #[test]
-    fn missing_and_stale_load_fail_closed() {
+    fn missing_and_stale_occupancy_fail_closed() {
         let mut missing = facts(1, 10, 0);
-        missing.load = None;
+        missing.occupancy = None;
         let mut stale = facts(2, 10, 0);
-        stale.load.as_mut().unwrap().freshness = STALE;
+        stale.occupancy.as_mut().unwrap().freshness = STALE;
         let decision = select_pool(input(), [stale, missing]).unwrap();
         assert!(decision.selected.is_none());
         assert_eq!(
@@ -285,7 +299,10 @@ mod tests {
                 .iter()
                 .map(|pool| pool.reason)
                 .collect::<Vec<_>>(),
-            vec![IneligibleReason::LoadMissing, IneligibleReason::LoadStale]
+            vec![
+                IneligibleReason::OccupancyMissing,
+                IneligibleReason::OccupancyStale,
+            ]
         );
     }
 
@@ -297,18 +314,18 @@ mod tests {
     }
 
     #[test]
-    fn exact_prefix_wins_when_its_load_is_less_than_one_uncached_block() {
-        assert_eq!(selected([facts(1, 9, 0), facts(2, 10, 255)]), pool(2));
+    fn exact_prefix_wins_before_occupancy() {
+        assert_eq!(selected([facts(1, 9, 0), facts(2, 10, 99)]), pool(2));
     }
 
     #[test]
-    fn active_prefill_load_can_outweigh_a_warmer_prefix() {
-        assert_eq!(selected([facts(1, 10, 600), facts(2, 9, 0)]), pool(2));
+    fn occupancy_breaks_an_equal_prefix_tie() {
+        assert_eq!(selected([facts(1, 10, 60), facts(2, 10, 50)]), pool(2));
     }
 
     #[test]
     fn local_pool_wins_an_exact_cost_tie() {
-        assert_eq!(selected([facts(2, 9, 256), facts(1, 10, 512)]), pool(1));
+        assert_eq!(selected([facts(2, 10, 50), facts(1, 10, 50)]), pool(1));
     }
 
     #[test]
