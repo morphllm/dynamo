@@ -97,6 +97,24 @@ pub use crate::protocols::common::preprocessor::PreprocessedEmbeddingRequest;
 
 use crate::protocols::common::llm_backend::EmbeddingsEngineOutput;
 
+fn prepare_signed_wan_request(
+    request: &NvCreateChatCompletionRequest,
+    original_stream_flag: bool,
+) -> NvCreateChatCompletionRequest {
+    let mut signed_request = request.clone();
+    signed_request.inner.stream = Some(original_stream_flag);
+
+    // `enable_usage_for_nonstreaming` adds stream_options for Dynamo's internal
+    // streaming aggregation. That field is invalid on the regional HTTP hop once
+    // the client-facing stream flag is restored to false. The regional frontend
+    // enables unary usage accounting again after it validates the signed request.
+    if !original_stream_flag {
+        signed_request.inner.stream_options = None;
+    }
+
+    signed_request
+}
+
 fn routing_priorities(hints: Option<&AgentHints>) -> (Option<f64>, Option<u32>, Option<i32>) {
     let priority_jump = hints.and_then(|h| {
         h.priority
@@ -5491,8 +5509,7 @@ impl
                 message: error.to_string(),
             })?
         {
-            let mut signed_request = request.clone();
-            signed_request.inner.stream = Some(original_stream_flag);
+            let signed_request = prepare_signed_wan_request(&request, original_stream_flag);
             let normalized_body = serde_json::to_value(&signed_request).map_err(|error| {
                 crate::http::service::error::HttpError {
                     code: 500,
@@ -5932,6 +5949,39 @@ mod tests {
         ChatChoiceStream, ChatCompletionStreamResponseDelta, CreateChatCompletionStreamResponse,
         FinishReason, Role,
     };
+
+    #[test]
+    fn test_prepare_signed_wan_request_restores_client_stream_contract() {
+        let mut unary: NvCreateChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "morph-dsv4flash",
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": false
+        }))
+        .unwrap();
+        unary.enable_usage_for_nonstreaming(false);
+        unary.inner.stream = Some(true);
+
+        let signed_unary = prepare_signed_wan_request(&unary, false);
+        assert_eq!(signed_unary.inner.stream, Some(false));
+        assert!(signed_unary.inner.stream_options.is_none());
+
+        let streaming: NvCreateChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "morph-dsv4flash",
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": true,
+            "stream_options": {"include_usage": true}
+        }))
+        .unwrap();
+
+        let signed_streaming = prepare_signed_wan_request(&streaming, true);
+        assert_eq!(signed_streaming.inner.stream, Some(true));
+        assert!(
+            signed_streaming
+                .inner
+                .stream_options
+                .is_some_and(|options| options.include_usage)
+        );
+    }
 
     fn chat_stream_chunk(
         index: u32,
