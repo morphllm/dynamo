@@ -23,6 +23,7 @@ class _Metric:
 fake_prometheus = ModuleType("prometheus_client")
 fake_prometheus.Counter = lambda *args, **kwargs: _Metric()
 fake_prometheus.Histogram = lambda *args, **kwargs: _Metric()
+fake_prometheus.start_http_server = lambda *args, **kwargs: object()
 sys.modules.setdefault("prometheus_client", fake_prometheus)
 
 from dynamo.frontend.global_routing import (  # noqa: E402
@@ -34,6 +35,29 @@ from dynamo.frontend.global_routing import (  # noqa: E402
 from dynamo.frontend import global_routing as router_module  # noqa: E402
 
 pytestmark = [pytest.mark.pre_merge, pytest.mark.gpu_0, pytest.mark.unit]
+
+
+def test_metrics_server_is_started_once(monkeypatch):
+    started = []
+    monkeypatch.setenv("DYN_GLOBAL_ROUTER_METRICS_PORT", "9091")
+    monkeypatch.setattr(router_module, "_METRICS_SERVER", None)
+    monkeypatch.setattr(
+        router_module,
+        "start_http_server",
+        lambda port, *, addr: started.append((port, addr)) or object(),
+    )
+
+    MultiDcRouter(config(), client=object())
+    MultiDcRouter(config(), client=object())
+
+    assert started == [(9091, "0.0.0.0")]
+
+
+def test_metrics_server_rejects_invalid_port(monkeypatch):
+    monkeypatch.setenv("DYN_GLOBAL_ROUTER_METRICS_PORT", "0")
+    monkeypatch.setattr(router_module, "_METRICS_SERVER", None)
+    with pytest.raises(ValueError, match="between 1 and 65535"):
+        MultiDcRouter(config(), client=object())
 
 
 def fact(dc, prefix, used, *, capacity=100, ready=True, readiness_age=1, load_age=1, suffix=""):

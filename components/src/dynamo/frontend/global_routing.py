@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from typing import Any, AsyncGenerator, AsyncIterator
 
 import httpx
-from prometheus_client import Counter, Histogram
+from prometheus_client import Counter, Histogram, start_http_server
 
 DECISIONS = Counter(
     "dynamo_global_router_multi_dc_decisions_total",
@@ -41,6 +41,21 @@ REMOTE_SECONDS = Histogram(
 _MARKER = "_dynamo_global_router"
 _READY = 2
 _U64_MAX = (1 << 64) - 1
+_METRICS_SERVER = None
+
+
+def _start_metrics_server() -> None:
+    """Expose this module's Python collectors beside the Rust frontend metrics."""
+    global _METRICS_SERVER
+    if _METRICS_SERVER is not None:
+        return
+    raw_port = os.getenv("DYN_GLOBAL_ROUTER_METRICS_PORT")
+    if raw_port is None:
+        return
+    port = int(raw_port)
+    if not 1 <= port <= 65_535:
+        raise ValueError("DYN_GLOBAL_ROUTER_METRICS_PORT must be between 1 and 65535")
+    _METRICS_SERVER = start_http_server(port, addr="0.0.0.0")
 
 
 @dataclass(frozen=True)
@@ -239,6 +254,7 @@ class MultiDcRouter:
     def __init__(self, config: MultiDcConfig, client: httpx.AsyncClient | None = None):
         if config.block_size <= 0:
             raise ValueError("multi_dc block_size must be positive")
+        _start_metrics_server()
         self.config = config
         self.client = client or httpx.AsyncClient(
             http2=True,
