@@ -5457,6 +5457,14 @@ impl
             .await?;
         attach_agent_context_from_context(&mut common_request, &context);
 
+        crate::global_routing_shadow::observe(
+            &common_request.model,
+            &common_request.token_ids,
+            self.kv_cache_block_size,
+            &request_id,
+            common_request.multi_modal_data.is_some() || common_request.mm_routing_info.is_some(),
+        );
+
         let uses_tool_call_structural_tag = self.apply_tool_choice_guided_decoding(
             &request,
             &mut common_request,
@@ -5654,6 +5662,14 @@ impl
         let mut common_request = builder.build()?;
         Self::validate_preprocessed_token_budget(&common_request, self.token_budget.as_ref())?;
         attach_agent_context_from_context(&mut common_request, &context);
+
+        crate::global_routing_shadow::observe(
+            &common_request.model,
+            &common_request.token_ids,
+            self.kv_cache_block_size,
+            &request_id,
+            common_request.multi_modal_data.is_some() || common_request.mm_routing_info.is_some(),
+        );
 
         let trace_state = crate::request_trace::build_request_end_trace_state(
             &common_request,

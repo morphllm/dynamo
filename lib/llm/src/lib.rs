@@ -17,6 +17,7 @@ pub mod first_token;
 pub mod fpm_publisher;
 pub mod fpm_trace;
 pub mod frontend_config;
+pub mod global_routing_shadow;
 pub mod grpc;
 pub mod http;
 pub mod hub;

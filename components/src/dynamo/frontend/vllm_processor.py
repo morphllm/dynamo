@@ -41,7 +41,6 @@ from dynamo.frontend.frontend_args import FrontendConfig
 from dynamo.llm import ModelCardInstanceId, PythonAsyncEngine, RoutedEngine
 from dynamo.vllm.errors import vllm_client_error_to_http_error
 
-from .global_routing import MultiDcRouter
 from .prepost import StreamingPostProcessor, preprocess_chat_request
 from .thinking import runtime_default_thinking_mode
 from .utils import (
@@ -311,7 +310,6 @@ class VllmProcessor:
         self.tokenizer = tokenizer
         self.input_processor = input_processor
         self.routed_engine = routed_engine
-        self.global_router = MultiDcRouter.from_env(block_size)
         self.output_processor = output_processor
         self.tool_parser_class = tool_parser_class
         self.reasoning_parser_class = reasoning_parser_class
@@ -528,20 +526,6 @@ class VllmProcessor:
     ) -> AsyncGenerator[dict[str, Any], None]:
         request_id = random_uuid()
 
-        global_route_bypass = False
-        if self.global_router is not None:
-            try:
-                global_route_bypass = self.global_router.consume_private_marker(request)
-            except ValueError as error:
-                yield {
-                    "error": {
-                        "message": str(error),
-                        "type": "invalid_request_error",
-                    }
-                }
-                return
-        raw_openai_request = json.loads(json.dumps(request))
-
         messages = request.get("messages") or []
         _normalize_vllm_image_parts(messages)
         # Validate cache-UUID modality support before vLLM downloads or
@@ -573,17 +557,6 @@ class VllmProcessor:
         engine_prompt = pre.engine_prompt
         tokens = pre.prompt_token_ids
         guided_decoding = pre.guided_decoding
-
-        if self.global_router is not None:
-            remote_route = await self.global_router.decide(
-                request["model"], tokens, request_id, global_route_bypass
-            )
-            if remote_route is not None:
-                async for remote_item in self.global_router.stream_remote(
-                    remote_route, raw_openai_request, request_id
-                ):
-                    yield remote_item
-                return
 
         if request_for_sampling.max_completion_tokens is not None:
             max_tokens = request_for_sampling.max_completion_tokens

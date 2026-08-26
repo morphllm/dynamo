@@ -18,6 +18,9 @@ use dynamo_kv_router::protocols::{
 use serde::{Deserialize, Serialize};
 
 use crate::lane::{LaneAvailability, LaneSet, LaneUnavailableReason};
+use crate::policy::{
+    Freshness, LaneFact, OccupancyFact, PolicyInput, PoolFacts, ReadinessFact, select_pool,
+};
 
 #[derive(Clone)]
 pub struct PoolMetadata {
@@ -67,6 +70,10 @@ pub struct Metrics {
     query_errors: AtomicU64,
     catalog_rebuilds: AtomicU64,
     lane_rebuilds: AtomicU64,
+    decisions_local: AtomicU64,
+    decisions_remote: AtomicU64,
+    decisions_none: AtomicU64,
+    decision_errors: AtomicU64,
 }
 
 #[derive(Clone, Default)]
@@ -192,6 +199,27 @@ struct TokenPrefixMatchesRequest {
     is_eagle: Option<bool>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TokenDecisionRequest {
+    #[serde(flatten)]
+    query: TokenPrefixMatchesRequest,
+    local_dc: u64,
+    stable_tie_key: u64,
+    readiness_max_age_ms: u64,
+    load_max_age_ms: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct TokenDecisionResponse {
+    generation: u64,
+    selected_pool_id: Option<String>,
+    selected_dc: Option<u64>,
+    outcome: &'static str,
+    matched_prefix_blocks: Option<u64>,
+    uncached_prefill_tokens: Option<u64>,
+}
+
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum QueryRole {
@@ -229,6 +257,8 @@ impl From<QueryRole> for QueryRoleResponse {
 
 #[derive(Debug, Serialize)]
 struct PoolFact {
+    #[serde(skip)]
+    native_pool_id: PoolId,
     pool_id: String,
     indexer_domain: IndexerDomainFact,
     relay: String,
@@ -272,6 +302,10 @@ pub fn api_router(state: AppState, max_query_blocks: usize) -> Router {
         .route(
             "/v1/prefix-matches/tokens",
             post(move |state, request| token_prefix_matches(state, request, max_query_blocks)),
+        )
+        .route(
+            "/v1/decisions/tokens",
+            post(move |state, request| token_decision(state, request, max_query_blocks)),
         )
         .with_state(state)
 }
@@ -375,6 +409,139 @@ async fn token_prefix_matches(
             error.into_response()
         }
     }
+}
+
+async fn token_decision(
+    State(state): State<AppState>,
+    Json(request): Json<TokenDecisionRequest>,
+    max_query_blocks: usize,
+) -> Response {
+    state.metrics.queries.fetch_add(1, Ordering::Relaxed);
+    if request.query.model.trim().is_empty() {
+        return decision_error(&state, ApiError::bad_request("model must not be empty"));
+    }
+    let hashes = match native_hashes(&request.query, max_query_blocks) {
+        Ok(hashes) => hashes,
+        Err(error) => return decision_error(&state, error),
+    };
+    let (generation, pools) = match collect_facts(
+        &state,
+        Some(&request.query.model),
+        request.query.role,
+        &hashes,
+    ) {
+        Ok(result) => result,
+        Err(error) => return decision_error(&state, error),
+    };
+    if pools.is_empty() {
+        return decision_error(
+            &state,
+            ApiError::not_found("no catalog pool matches model and role"),
+        );
+    }
+    let input = PolicyInput {
+        local_dc: dynamo_kv_router::identity::DcId::new(request.local_dc),
+        query_block_count: hashes.len() as u64,
+        native_block_size_tokens: request.query.block_size as u64,
+        stable_tie_key: request.stable_tie_key,
+    };
+    let candidates = pools.iter().map(|pool| PoolFacts {
+        pool_id: pool.native_pool_id,
+        lane: if pool.availability == "available" && pool.prefix_depth_blocks.is_some() {
+            LaneFact::Available
+        } else {
+            LaneFact::Unavailable
+        },
+        matched_prefix_blocks: u64::from(pool.prefix_depth_blocks.unwrap_or(0)),
+        readiness: pool.readiness_age_ms.map(|age| ReadinessFact {
+            ready: pool.readiness.iter().any(|signal| {
+                signal.canonical_model_id == request.query.model && signal.state == 2
+            }),
+            freshness: Freshness {
+                age: std::time::Duration::from_millis(age),
+                maximum_age: std::time::Duration::from_millis(request.readiness_max_age_ms),
+            },
+        }),
+        occupancy: match (
+            pool.kv_used_blocks,
+            pool.total_kv_blocks,
+            pool.kv_observed_ranks,
+            pool.kv_expected_ranks,
+            pool.load_age_ms,
+        ) {
+            (
+                Some(used_blocks),
+                Some(total_blocks),
+                Some(observed_ranks),
+                Some(expected_ranks),
+                Some(age),
+            ) => Some(OccupancyFact {
+                used_blocks,
+                total_blocks,
+                observed_ranks,
+                expected_ranks,
+                freshness: Freshness {
+                    age: std::time::Duration::from_millis(age),
+                    maximum_age: std::time::Duration::from_millis(request.load_max_age_ms),
+                },
+            }),
+            _ => None,
+        },
+    });
+    let decision = match select_pool(input, candidates) {
+        Ok(decision) => decision,
+        Err(_) => return decision_error(&state, ApiError::internal("routing policy failed")),
+    };
+    let (selected_pool_id, selected_dc, outcome, matched_prefix_blocks, uncached_prefill_tokens) =
+        match decision.selected {
+            Some(selected) => {
+                let dc = selected.pool_id.dc_id().get();
+                if dc == request.local_dc {
+                    state
+                        .metrics
+                        .decisions_local
+                        .fetch_add(1, Ordering::Relaxed);
+                } else {
+                    state
+                        .metrics
+                        .decisions_remote
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                (
+                    Some(selected.pool_id.to_string()),
+                    Some(dc),
+                    if dc == request.local_dc {
+                        "local"
+                    } else {
+                        "remote"
+                    },
+                    Some(selected.matched_prefix_blocks),
+                    Some(selected.uncached_prefill_tokens),
+                )
+            }
+            None => {
+                state.metrics.decisions_none.fetch_add(1, Ordering::Relaxed);
+                (None, None, "none", None, None)
+            }
+        };
+    Json(TokenDecisionResponse {
+        generation,
+        selected_pool_id,
+        selected_dc,
+        outcome,
+        matched_prefix_blocks,
+        uncached_prefill_tokens,
+    })
+    .into_response()
+}
+
+fn decision_error(state: &AppState, error: ApiError) -> Response {
+    state.metrics.query_errors.fetch_add(1, Ordering::Relaxed);
+    state
+        .metrics
+        .decision_errors
+        .fetch_add(1, Ordering::Relaxed);
+    error.into_response()
 }
 
 fn native_hashes(
@@ -494,6 +661,7 @@ fn collect_facts(
             let (availability, unavailable_reason) = availability(status.availability);
             let signal = signals.get(&metadata.pool_id).cloned().unwrap_or_default();
             facts.push(PoolFact {
+                native_pool_id: metadata.pool_id,
                 pool_id: metadata.pool_id.to_string(),
                 indexer_domain: indexer_domain_fact(metadata.pool_id),
                 relay: metadata.relay.clone(),
@@ -601,13 +769,23 @@ async fn metrics(State(state): State<AppState>) -> String {
             "# TYPE global_ckf_consumer_catalog_rebuilds_total counter\n",
             "global_ckf_consumer_catalog_rebuilds_total {}\n",
             "# TYPE global_ckf_consumer_lane_rebuilds_total counter\n",
-            "global_ckf_consumer_lane_rebuilds_total {}\n"
+            "global_ckf_consumer_lane_rebuilds_total {}\n",
+            "# TYPE global_ckf_consumer_decisions_total counter\n",
+            "global_ckf_consumer_decisions_total{{outcome=\"local\"}} {}\n",
+            "global_ckf_consumer_decisions_total{{outcome=\"remote\"}} {}\n",
+            "global_ckf_consumer_decisions_total{{outcome=\"none\"}} {}\n",
+            "# TYPE global_ckf_consumer_decision_errors_total counter\n",
+            "global_ckf_consumer_decision_errors_total {}\n"
         ),
         ready,
         state.metrics.queries.load(Ordering::Relaxed),
         state.metrics.query_errors.load(Ordering::Relaxed),
         state.metrics.catalog_rebuilds.load(Ordering::Relaxed),
         state.metrics.lane_rebuilds.load(Ordering::Relaxed),
+        state.metrics.decisions_local.load(Ordering::Relaxed),
+        state.metrics.decisions_remote.load(Ordering::Relaxed),
+        state.metrics.decisions_none.load(Ordering::Relaxed),
+        state.metrics.decision_errors.load(Ordering::Relaxed),
     )
 }
 
