@@ -285,18 +285,22 @@ async fn wait_until_ready(
     }
     let mut maintenance = tokio::time::interval(Duration::from_millis(250));
     loop {
-        let all_ready = supervisors
+        let any_streaming = supervisors
             .iter()
-            .all(|supervisor| matches!(*supervisor.state.borrow(), PoolStreamState::Streaming));
-        let all_lanes_ready = groups.iter().all(|group| {
+            .any(|supervisor| matches!(*supervisor.state.borrow(), PoolStreamState::Streaming));
+        let any_lane_ready = groups.iter().any(|group| {
             group.lanes.statuses(Instant::now()).is_ok_and(|statuses| {
-                !statuses.is_empty()
-                    && statuses
-                        .iter()
-                        .all(|status| status.availability == LaneAvailability::Available)
+                statuses
+                    .iter()
+                    .any(|status| status.availability == LaneAvailability::Available)
             })
         });
-        if all_ready && all_lanes_ready {
+        // A candidate is safe to publish once it contains one usable lane. Requiring
+        // every configured lane to finish rebuilding couples independent regions: a
+        // new or reconnecting relay can otherwise leave the shared catalog empty and
+        // take healthy regions out of service. The retained supervisors continue
+        // rebuilding unavailable lanes after publication.
+        if ready_to_publish(any_streaming, any_lane_ready) {
             return Ok(());
         }
         maintenance.tick().await;
@@ -307,6 +311,10 @@ async fn wait_until_ready(
             }
         }
     }
+}
+
+fn ready_to_publish(any_streaming: bool, any_lane_ready: bool) -> bool {
+    any_streaming && any_lane_ready
 }
 
 #[cfg(test)]
@@ -361,5 +369,17 @@ mod tests {
         };
         assert_ne!(a, b);
         let _ = KvPoolId::default();
+    }
+
+    #[test]
+    fn one_rebuilding_lane_does_not_block_healthy_lanes() {
+        assert!(ready_to_publish(true, true));
+    }
+
+    #[test]
+    fn candidate_without_an_available_lane_stays_unpublished() {
+        assert!(!ready_to_publish(false, true));
+        assert!(!ready_to_publish(true, false));
+        assert!(!ready_to_publish(false, false));
     }
 }
