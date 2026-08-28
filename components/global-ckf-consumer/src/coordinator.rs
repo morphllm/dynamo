@@ -280,9 +280,6 @@ async fn wait_until_ready(
     groups: &[PublishedGroup],
     supervisors: &mut [PoolSupervisor],
 ) -> Result<()> {
-    if supervisors.is_empty() {
-        return Ok(());
-    }
     let mut maintenance = tokio::time::interval(Duration::from_millis(250));
     loop {
         let any_streaming = supervisors
