@@ -283,12 +283,13 @@ class DynamoSglangPublisher:
         logging.info("DynamoSglangPublisher cleanup complete")
 
     def init_engine_metrics_publish(self) -> None:
-        """Publish initial dummy metrics to bootstrap the metrics endpoint."""
+        """Seed authoritative idle load for every local data parallel rank."""
         logging.info("Sending dummy metrics to initialize")
-        self.metrics_publisher.publish(self.dp_rank, kv_used_blocks=0)
-        dp_rank_str = str(self.dp_rank)
-        self.component_gauges.set_total_blocks(dp_rank_str, 0)
-        self.component_gauges.set_gpu_cache_usage(dp_rank_str, 0.0)
+        for dp_rank in get_local_dp_rank_range(self.server_args):
+            self.metrics_publisher.publish(dp_rank, kv_used_blocks=0)
+            dp_rank_str = str(dp_rank)
+            self.component_gauges.set_total_blocks(dp_rank_str, 0)
+            self.component_gauges.set_gpu_cache_usage(dp_rank_str, 0.0)
 
     def init_kv_event_publish(self) -> List[KvEventPublisher]:
         """Initialize KV event publisher(s) if configured.
