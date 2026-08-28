@@ -51,6 +51,19 @@ impl DcCkfFormatIdentity {
         }
     }
 
+    /// Construct the native identity for the single CKF format this crate supports.
+    ///
+    /// The fixed format fields cannot be supplied by callers, so a transport adapter cannot
+    /// manufacture an identity that the native table cannot ingest.
+    pub fn try_new(seed: u64, bucket_count: usize) -> Result<Self, CkfBuildError> {
+        if bucket_count < 2 || !bucket_count.is_power_of_two() {
+            return Err(CkfBuildError::InvalidBucketCount {
+                value: bucket_count,
+            });
+        }
+        Ok(Self::new(seed, bucket_count))
+    }
+
     pub const fn format_version(&self) -> u16 {
         self.format_version
     }
