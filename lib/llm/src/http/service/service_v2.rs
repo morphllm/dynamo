@@ -136,6 +136,7 @@ pub struct State {
     metrics: Arc<Metrics>,
     manager: Arc<ModelManager>,
     discovery_client: Arc<dyn Discovery>,
+    health_instances: super::health::HealthInstanceReconciler,
     service_observer: Arc<ServiceObserver>,
     flags: StateFlags,
     cancel_token: CancellationToken,
@@ -467,6 +468,7 @@ impl State {
             manager,
             metrics: Arc::new(Metrics::new_with_prefix(config.metrics_config.prefix())),
             discovery_client,
+            health_instances: super::health::HealthInstanceReconciler::default(),
             service_observer: Arc::new(ServiceObserver::default()),
             nvext_enabled: config.nvext_enabled,
             flags: StateFlags {
@@ -497,6 +499,14 @@ impl State {
 
     pub fn manager(&self) -> &ModelManager {
         Arc::as_ref(&self.manager)
+    }
+
+    pub(super) fn reconcile_health_instances(
+        &self,
+        observed: Option<Vec<dynamo_runtime::component::Instance>>,
+    ) -> super::health::ReconciledHealthInstances {
+        self.health_instances
+            .reconcile(observed, self.manager.has_any_ready_model())
     }
 
     pub fn manager_clone(&self) -> Arc<ModelManager> {
