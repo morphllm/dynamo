@@ -7,6 +7,7 @@ use global_ckf_consumer::api::{AppState, api_router, system_router};
 use global_ckf_consumer::config::Config;
 use global_ckf_consumer::coordinator;
 use global_ckf_consumer::supervisor::spawn_relay_supervisors;
+use std::collections::HashMap;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -19,7 +20,13 @@ async fn main() -> Result<()> {
     config.validate()?;
 
     let events = spawn_relay_supervisors(&config);
-    let state = AppState::default();
+    let state = AppState::with_capacity_by_dc(
+        config
+            .relays
+            .iter()
+            .map(|relay| (relay.expected_dc_id, relay.prefill_tps_per_rank))
+            .collect::<HashMap<_, _>>(),
+    );
     let api = tokio::net::TcpListener::bind(config.listen_address).await?;
     let system = tokio::net::TcpListener::bind(config.metrics_listen_address).await?;
     tokio::select! {

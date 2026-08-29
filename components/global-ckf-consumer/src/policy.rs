@@ -46,6 +46,7 @@ pub struct PoolFacts {
     pub matched_prefix_blocks: u64,
     pub readiness: Option<ReadinessFact>,
     pub occupancy: Option<OccupancyFact>,
+    pub prefill_tps_per_rank: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,6 +77,7 @@ pub struct EligiblePool {
     pub uncached_prefill_tokens: u64,
     pub used_blocks: u64,
     pub total_blocks: u64,
+    pub prefill_capacity_tps: u64,
     pub local: bool,
     pub stable_rank: u64,
 }
@@ -103,8 +105,8 @@ pub enum PolicyError {
 
 /// Select an exact global pool without changing the facts API or forwarding a request.
 ///
-/// Eligibility is fail closed. Eligible pools are ordered by total prefill work, then local DC,
-/// then a stable request keyed rank. Input order is never a tie breaker.
+/// Eligibility is fail closed. Eligible pools are ordered by projected uncached prefill time,
+/// then occupancy, local DC, and a stable request keyed rank. Input order is never a tie breaker.
 pub fn select_pool(
     input: PolicyInput,
     pools: impl IntoIterator<Item = PoolFacts>,
@@ -173,6 +175,12 @@ fn evaluate_pool(
     }
 
     let occupancy = facts.occupancy.expect("eligible pool has occupancy");
+    let prefill_capacity_tps = facts
+        .prefill_tps_per_rank
+        .checked_mul(u64::from(occupancy.expected_ranks))
+        .ok_or(PolicyError::TokenArithmeticOverflow {
+            pool_id: facts.pool_id,
+        })?;
     let cached_tokens = facts
         .matched_prefix_blocks
         .checked_mul(input.native_block_size_tokens)
@@ -186,14 +194,15 @@ fn evaluate_pool(
         uncached_prefill_tokens,
         used_blocks: occupancy.used_blocks,
         total_blocks: occupancy.total_blocks,
+        prefill_capacity_tps,
         local: facts.pool_id.dc_id() == input.local_dc,
         stable_rank: stable_pool_rank(input.stable_tie_key, facts.pool_id),
     }))
 }
 
 fn candidate_order(left: &EligiblePool, right: &EligiblePool) -> std::cmp::Ordering {
-    left.uncached_prefill_tokens
-        .cmp(&right.uncached_prefill_tokens)
+    (u128::from(left.uncached_prefill_tokens) * u128::from(right.prefill_capacity_tps))
+        .cmp(&(u128::from(right.uncached_prefill_tokens) * u128::from(left.prefill_capacity_tps)))
         .then_with(|| {
             (u128::from(left.used_blocks) * u128::from(right.total_blocks))
                 .cmp(&(u128::from(right.used_blocks) * u128::from(left.total_blocks)))
@@ -278,6 +287,7 @@ mod tests {
                 expected_ranks: 1,
                 freshness: FRESH,
             }),
+            prefill_tps_per_rank: 10_000,
         }
     }
 
@@ -320,6 +330,23 @@ mod tests {
     #[test]
     fn exact_prefix_wins_before_occupancy() {
         assert_eq!(selected([facts(1, 9, 0), facts(2, 10, 99)]), pool(2));
+    }
+
+    #[test]
+    fn faster_pool_wins_on_projected_prefill_time() {
+        let slow = facts(1, 10, 0);
+        let mut fast = facts(2, 9, 0);
+        fast.prefill_tps_per_rank = 100_000;
+        assert_eq!(selected([slow, fast]), pool(2));
+    }
+
+    #[test]
+    fn capacity_scales_with_live_rank_count() {
+        let one_rank = facts(1, 8, 0);
+        let mut eight_ranks = facts(2, 0, 0);
+        eight_ranks.occupancy.as_mut().unwrap().observed_ranks = 8;
+        eight_ranks.occupancy.as_mut().unwrap().expected_ranks = 8;
+        assert_eq!(selected([one_rank, eight_ranks]), pool(2));
     }
 
     #[test]

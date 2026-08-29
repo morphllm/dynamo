@@ -82,9 +82,16 @@ pub struct AppState {
     published: Arc<RwLock<PublishedState>>,
     signals: Arc<RwLock<HashMap<PoolId, PoolSignals>>>,
     pub metrics: Arc<Metrics>,
+    capacity_by_dc: Arc<HashMap<u64, u64>>,
 }
 
 impl AppState {
+    pub fn with_capacity_by_dc(capacity_by_dc: HashMap<u64, u64>) -> Self {
+        Self {
+            capacity_by_dc: Arc::new(capacity_by_dc),
+            ..Self::default()
+        }
+    }
     pub fn publish(&self, groups: Vec<PublishedGroup>) -> Result<u64, &'static str> {
         let mut state = self
             .published
@@ -538,6 +545,7 @@ pub(crate) fn evaluate_decision(
             }),
             _ => None,
         },
+        prefill_tps_per_rank: state.capacity_by_dc.get(&pool.dc_id).copied().unwrap_or(1),
     });
     let decision =
         select_pool(input, candidates).map_err(|_| ApiError::internal("routing policy failed"))?;

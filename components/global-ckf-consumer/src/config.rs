@@ -65,6 +65,7 @@ pub struct RelayConfig {
     pub address: String,
     pub tls_server_name: String,
     pub expected_dc_id: u64,
+    pub prefill_tps_per_rank: u64,
 }
 
 impl FromStr for RelayConfig {
@@ -72,8 +73,17 @@ impl FromStr for RelayConfig {
 
     fn from_str(value: &str) -> Result<Self> {
         let fields: Vec<_> = value.split(',').collect();
-        let [name, address, tls_server_name, expected_dc_id] = fields.as_slice() else {
-            bail!("relay must be name,host:port,tls-server-name,expected-dc-id");
+        let [
+            name,
+            address,
+            tls_server_name,
+            expected_dc_id,
+            prefill_tps_per_rank,
+        ] = fields.as_slice()
+        else {
+            bail!(
+                "relay must be name,host:port,tls-server-name,expected-dc-id,prefill-tps-per-rank"
+            );
         };
         validate_text("relay name", name)?;
         validate_text("relay address", address)?;
@@ -91,11 +101,18 @@ impl FromStr for RelayConfig {
         let expected_dc_id = expected_dc_id
             .parse::<u64>()
             .context("expected DC ID must be a valid u64")?;
+        let prefill_tps_per_rank = prefill_tps_per_rank
+            .parse::<u64>()
+            .context("prefill TPS per rank must be a valid u64")?;
+        if prefill_tps_per_rank == 0 {
+            bail!("prefill TPS per rank must be greater than zero");
+        }
         Ok(Self {
             name: (*name).to_string(),
             address: (*address).to_string(),
             tls_server_name: (*tls_server_name).to_string(),
             expected_dc_id,
+            prefill_tps_per_rank,
         })
     }
 }
@@ -113,26 +130,29 @@ mod tests {
 
     #[test]
     fn relay_config_parses_exact_identity_boundary() {
-        let relay =
-            RelayConfig::from_str("ue5,relay.internal:4443,relay.dynamo.svc.cluster.local,17")
-                .unwrap();
+        let relay = RelayConfig::from_str(
+            "ue5,relay.internal:4443,relay.dynamo.svc.cluster.local,17,10000",
+        )
+        .unwrap();
         assert_eq!(relay.name, "ue5");
         assert_eq!(relay.address, "relay.internal:4443");
         assert_eq!(relay.tls_server_name, "relay.dynamo.svc.cluster.local");
         assert_eq!(relay.expected_dc_id, 17);
+        assert_eq!(relay.prefill_tps_per_rank, 10_000);
     }
 
     #[test]
     fn relay_config_rejects_ambiguous_or_insecure_addresses() {
-        assert!(RelayConfig::from_str("ue5,https://relay:4443,relay,17").is_err());
-        assert!(RelayConfig::from_str("ue5,relay,relay,17").is_err());
-        assert!(RelayConfig::from_str("ue5,relay:0,relay,17").is_err());
-        assert!(RelayConfig::from_str("ue5,relay:4443,relay").is_err());
+        assert!(RelayConfig::from_str("ue5,https://relay:4443,relay,17,10000").is_err());
+        assert!(RelayConfig::from_str("ue5,relay,relay,17,10000").is_err());
+        assert!(RelayConfig::from_str("ue5,relay:0,relay,17,10000").is_err());
+        assert!(RelayConfig::from_str("ue5,relay:4443,relay,17").is_err());
+        assert!(RelayConfig::from_str("ue5,relay:4443,relay,17,0").is_err());
     }
 
     #[test]
     fn config_rejects_duplicate_names_and_dc_ids() {
-        let relay = RelayConfig::from_str("ue5,relay:4443,relay,17").unwrap();
+        let relay = RelayConfig::from_str("ue5,relay:4443,relay,17,10000").unwrap();
         let mut config = Config {
             relays: vec![relay.clone(), relay],
             tls_cert: "cert".into(),
