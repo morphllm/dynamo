@@ -1,0 +1,19 @@
+steps:
+  - name: gcr.io/cloud-builders/docker
+    entrypoint: bash
+    args:
+      - -ceu
+      - |
+        docker run --privileged --rm tonistiigi/binfmt --install arm64
+        docker buildx create --name arm-builder --use
+        docker buildx build \
+          --platform linux/arm64 \
+          --file heartbeat.Dockerfile \
+          --target heartbeat_overlay \
+          --build-arg HEARTBEAT_BASE_IMAGE=us-docker.pkg.dev/telemetron-production/dynamo-us/dynamo-sglang@sha256:a0605049011514516ee2c71c2d4d95c5517cae1e152b73663598ba8deae34c44 \
+          --tag us-docker.pkg.dev/telemetron-production/dynamo-us/dynamo-sglang:dsv4flash-idle-heartbeat-642485d-v1 \
+          --push \
+          .
+options:
+  machineType: E2_HIGHCPU_32
+timeout: 7200s
