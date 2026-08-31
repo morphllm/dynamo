@@ -1,6 +1,9 @@
 // SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use std::collections::BTreeMap;
+use std::time::Duration;
+
 use anyhow::Result;
 
 use dynamo_kv_router::protocols::{ActiveLoad, DpRank};
@@ -18,13 +21,16 @@ struct WorkerMetrics {
 }
 
 pub struct WorkerMetricsPublisher {
-    tx: tokio::sync::watch::Sender<WorkerMetrics>,
-    rx: tokio::sync::watch::Receiver<WorkerMetrics>,
+    tx: tokio::sync::watch::Sender<BTreeMap<DpRank, WorkerMetrics>>,
+    rx: tokio::sync::watch::Receiver<BTreeMap<DpRank, WorkerMetrics>>,
 }
+
+const PUBLISH_DEBOUNCE: Duration = Duration::from_millis(1);
+const IDLE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 
 impl WorkerMetricsPublisher {
     pub fn new() -> Result<Self> {
-        let (tx, rx) = tokio::sync::watch::channel(WorkerMetrics::default());
+        let (tx, rx) = tokio::sync::watch::channel(BTreeMap::new());
         Ok(Self { tx, rx })
     }
 
@@ -49,9 +55,14 @@ impl WorkerMetricsPublisher {
             metrics.active_decode_blocks,
             metrics.kv_used_blocks
         );
-        self.tx
-            .send(metrics)
-            .map_err(|_| anyhow::anyhow!("metrics channel closed"))
+        self.tx.send_if_modified(|latest_by_rank| {
+            if latest_by_rank.get(&metrics.dp_rank) == Some(&metrics) {
+                return false;
+            }
+            latest_by_rank.insert(metrics.dp_rank, metrics);
+            true
+        });
+        Ok(())
     }
 
     pub async fn create_endpoint(&self, endpoint: Endpoint) -> Result<()> {
@@ -62,18 +73,20 @@ impl WorkerMetricsPublisher {
     }
 
     pub(super) fn start_metrics_publishing(&self, event_publisher: EventPublisher, worker_id: u64) {
-        let metrics_rx = self.rx.clone();
+        let mut metrics_rx = self.rx.clone();
 
         tokio::spawn(async move {
-            let mut rx = metrics_rx;
-            let mut last_metrics: Option<WorkerMetrics> = None;
-            let mut pending_publish: Option<WorkerMetrics> = None;
+            let mut latest_by_rank = BTreeMap::<DpRank, WorkerMetrics>::new();
+            let mut pending_by_rank = BTreeMap::<DpRank, WorkerMetrics>::new();
             let publish_timer = tokio::time::sleep(tokio::time::Duration::ZERO);
             tokio::pin!(publish_timer);
+            let first_heartbeat = tokio::time::Instant::now() + IDLE_HEARTBEAT_INTERVAL;
+            let mut heartbeat = tokio::time::interval_at(first_heartbeat, IDLE_HEARTBEAT_INTERVAL);
+            heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
             loop {
                 tokio::select! {
-                    result = rx.changed() => {
+                    result = metrics_rx.changed() => {
                         if result.is_err() {
                             tracing::debug!(
                                 "Metrics publisher sender dropped, stopping event-plane background task"
@@ -81,35 +94,68 @@ impl WorkerMetricsPublisher {
                             break;
                         }
 
-                        let metrics = rx.borrow_and_update().clone();
-                        if last_metrics.as_ref() == Some(&metrics) {
-                            continue;
-                        }
-
-                        pending_publish = Some(metrics.clone());
-                        last_metrics = Some(metrics);
-                        publish_timer.as_mut().reset(
-                            tokio::time::Instant::now()
-                                + tokio::time::Duration::from_millis(1)
-                        );
-                    }
-                    _ = &mut publish_timer, if pending_publish.is_some() => {
-                        if let Some(metrics) = pending_publish.take() {
-                            let active_load = ActiveLoad {
-                                worker_id,
-                                dp_rank: metrics.dp_rank,
-                                active_decode_blocks: metrics.active_decode_blocks,
-                                active_prefill_tokens: None,
-                                kv_used_blocks: metrics.kv_used_blocks,
-                            };
-
-                            if let Err(e) = event_publisher.publish(&active_load).await {
-                                tracing::warn!("Failed to publish metrics: {}", e);
+                        let received = metrics_rx.borrow_and_update().clone();
+                        for (&rank, metrics) in &received {
+                            if latest_by_rank.get(&rank) != Some(metrics) {
+                                pending_by_rank.insert(rank, metrics.clone());
                             }
+                        }
+                        latest_by_rank = received;
+                        if !pending_by_rank.is_empty() {
+                            publish_timer.as_mut().reset(
+                                tokio::time::Instant::now() + PUBLISH_DEBOUNCE
+                            );
+                        }
+                    }
+                    _ = &mut publish_timer, if !pending_by_rank.is_empty() => {
+                        for (_, metrics) in std::mem::take(&mut pending_by_rank) {
+                            publish_metrics(&event_publisher, worker_id, &metrics).await;
+                        }
+                    }
+                    _ = heartbeat.tick(), if !latest_by_rank.is_empty() => {
+                        for metrics in latest_by_rank.values() {
+                            publish_metrics(&event_publisher, worker_id, metrics).await;
                         }
                     }
                 }
             }
         });
+    }
+}
+
+async fn publish_metrics(
+    event_publisher: &EventPublisher,
+    worker_id: u64,
+    metrics: &WorkerMetrics,
+) {
+    let active_load = ActiveLoad {
+        worker_id,
+        dp_rank: metrics.dp_rank,
+        active_decode_blocks: metrics.active_decode_blocks,
+        active_prefill_tokens: None,
+        kv_used_blocks: metrics.kv_used_blocks,
+    };
+
+    if let Err(error) = event_publisher.publish(&active_load).await {
+        tracing::warn!(%error, dp_rank = metrics.dp_rank, "Failed to publish metrics");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retains_latest_metrics_for_every_rank() {
+        let publisher = WorkerMetricsPublisher::new().unwrap();
+
+        publisher.publish(Some(0), None, Some(0)).unwrap();
+        publisher.publish(Some(1), None, Some(7)).unwrap();
+        publisher.publish(Some(0), None, Some(3)).unwrap();
+
+        let latest = publisher.rx.borrow();
+        assert_eq!(latest.len(), 2);
+        assert_eq!(latest[&0].kv_used_blocks, Some(3));
+        assert_eq!(latest[&1].kv_used_blocks, Some(7));
     }
 }

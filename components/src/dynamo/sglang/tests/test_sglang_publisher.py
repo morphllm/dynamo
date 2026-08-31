@@ -28,6 +28,29 @@ pytestmark = [
 ]
 
 
+def test_idle_load_bootstrap_covers_every_local_dp_rank():
+    metrics_publisher = Mock()
+    component_gauges = Mock()
+    publisher = SimpleNamespace(
+        server_args=SimpleNamespace(
+            dp_size=8,
+            enable_dp_attention=True,
+            nnodes=1,
+            node_rank=0,
+        ),
+        metrics_publisher=metrics_publisher,
+        component_gauges=component_gauges,
+    )
+
+    publisher_mod.DynamoSglangPublisher.init_engine_metrics_publish(publisher)
+
+    assert metrics_publisher.publish.call_args_list == [
+        ((rank,), {"kv_used_blocks": 0}) for rank in range(8)
+    ]
+    assert component_gauges.set_total_blocks.call_count == 8
+    assert component_gauges.set_gpu_cache_usage.call_count == 8
+
+
 def test_get_local_dp_rank_range_defaults_to_rank_zero():
     server_args = SimpleNamespace(
         dp_size=1,

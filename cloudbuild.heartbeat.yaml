@@ -1,0 +1,18 @@
+steps:
+  - name: gcr.io/cloud-builders/docker
+    entrypoint: bash
+    args:
+      - -ceu
+      - |
+        docker buildx create --name amd-builder --use
+        docker buildx build \
+          --platform linux/amd64 \
+          --file heartbeat.Dockerfile \
+          --target heartbeat_overlay \
+          --build-arg HEARTBEAT_BASE_IMAGE=europe-west4-docker.pkg.dev/telemetron-production/dynamo/morph-vllm-dynamo@sha256:e30e461f3cfc138d2ee0157e5b99025c6896a08188ec486fa15916b902dbb8d4 \
+          --tag europe-west4-docker.pkg.dev/telemetron-production/dynamo/morph-vllm-dynamo:dsv4flash-idle-heartbeat-642485d-v1 \
+          --push \
+          .
+options:
+  machineType: E2_HIGHCPU_32
+timeout: 3600s

@@ -1,0 +1,6 @@
+#!include:.gitignore
+
+# These tracked Rust modules are matched by the repository's broad core.*
+# crash-dump ignore rule. Cloud Build needs the complete tracked source tree.
+!lib/mocker/src/scheduler/sglang/core.rs
+!lib/mocker/src/scheduler/vllm/core.rs
