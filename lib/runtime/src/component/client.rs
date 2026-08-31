@@ -665,6 +665,15 @@ impl Client {
         self.instance_avail_owner.as_ref().clone()
     }
 
+    /// Get a watcher for the authoritative discovered instance IDs.
+    ///
+    /// Unlike [`Self::instance_avail_watcher`], this view is not changed by
+    /// short lived transport inhibition. Consumers that size durable capacity
+    /// must use this source and keep routability as a separate concern.
+    pub fn instance_source_watcher(&self) -> tokio::sync::watch::Receiver<Vec<Instance>> {
+        self.instance_source.as_ref().clone()
+    }
+
     /// Create a client view whose routable instances are restricted by a caller-owned
     /// admission set.
     ///
@@ -1537,6 +1546,46 @@ mod tests {
         // Note: We need to check if changed() was signaled
         let current = watcher.borrow().clone();
         assert_eq!(current, vec![1, 3]);
+
+        rt.shutdown();
+    }
+
+    #[tokio::test]
+    async fn source_watcher_is_not_zeroed_by_transport_inhibition() {
+        let rt = Runtime::from_current().unwrap();
+        let drt = DistributedRuntime::new(rt.clone(), DistributedConfig::process_local())
+            .await
+            .unwrap();
+        let ns = drt
+            .namespace("test_source_watcher_inhibition".to_string())
+            .unwrap();
+        let component = ns.component("test_component".to_string()).unwrap();
+        let endpoint = component.endpoint("test_endpoint".to_string());
+        let client = Client::with_reconcile_interval(endpoint.clone(), Duration::from_secs(60))
+            .await
+            .unwrap();
+        let source = client.instance_source_watcher();
+
+        endpoint.register_endpoint_instance().await.unwrap();
+        let worker_id = client.wait_for_instances().await.unwrap()[0].id();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !source
+                .borrow()
+                .iter()
+                .any(|instance| instance.id() == worker_id)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        client.report_instance_down(worker_id);
+        assert!(client.instance_ids_avail().is_empty());
+        assert_eq!(
+            source.borrow().iter().map(Instance::id).collect::<Vec<_>>(),
+            [worker_id]
+        );
 
         rt.shutdown();
     }

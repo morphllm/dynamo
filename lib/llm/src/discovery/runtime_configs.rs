@@ -1,7 +1,10 @@
 // SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    ops::{Deref, DerefMut},
+};
 
 use futures::StreamExt;
 use tokio::sync::watch;
@@ -17,8 +20,72 @@ use crate::local_model::runtime_config::ModelRuntimeConfig;
 use crate::model_card::ModelDeploymentCard;
 use dynamo_kv_router::protocols::WorkerId;
 
-/// Type alias for the runtime config watch receiver.
-pub type RuntimeConfigWatch = watch::Receiver<HashMap<WorkerId, ModelRuntimeConfig>>;
+/// Runtime configurations split into routing and admission views.
+///
+/// `ready` excludes workers under short lived transport inhibition. The
+/// admission count comes from authoritative endpoint discovery joined with
+/// runtime configuration and therefore does not collapse during that
+/// inhibition window.
+#[derive(Clone)]
+pub struct RuntimeConfigWatch {
+    ready: watch::Receiver<HashMap<WorkerId, ModelRuntimeConfig>>,
+    admission_worker_count: watch::Receiver<usize>,
+}
+
+impl RuntimeConfigWatch {
+    pub fn from_ready(ready: watch::Receiver<HashMap<WorkerId, ModelRuntimeConfig>>) -> Self {
+        let count = ready.borrow().len();
+        let (_tx, admission_worker_count) = watch::channel(count);
+        Self {
+            ready,
+            admission_worker_count,
+        }
+    }
+
+    pub fn admission_worker_count(&self) -> watch::Receiver<usize> {
+        self.admission_worker_count.clone()
+    }
+
+    pub fn ready_receiver(&self) -> watch::Receiver<HashMap<WorkerId, ModelRuntimeConfig>> {
+        self.ready.clone()
+    }
+}
+
+impl Deref for RuntimeConfigWatch {
+    type Target = watch::Receiver<HashMap<WorkerId, ModelRuntimeConfig>>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.ready
+    }
+}
+
+impl DerefMut for RuntimeConfigWatch {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.ready
+    }
+}
+
+impl From<watch::Receiver<HashMap<WorkerId, ModelRuntimeConfig>>> for RuntimeConfigWatch {
+    fn from(ready: watch::Receiver<HashMap<WorkerId, ModelRuntimeConfig>>) -> Self {
+        Self::from_ready(ready)
+    }
+}
+
+fn join_runtime_configs(
+    routable: impl IntoIterator<Item = WorkerId>,
+    discovered: impl IntoIterator<Item = WorkerId>,
+    configs: &HashMap<WorkerId, ModelRuntimeConfig>,
+) -> (HashMap<WorkerId, ModelRuntimeConfig>, usize) {
+    let ready = routable
+        .into_iter()
+        .filter_map(|id| configs.get(&id).map(|config| (id, config.clone())))
+        .collect();
+    let admission_count = discovered
+        .into_iter()
+        .filter(|id| configs.contains_key(id))
+        .count();
+    (ready, admission_count)
+}
 
 // `lifecycle` bounds this task directly rather than leaving it to notice its
 // receiver is gone. That receiver-drop signal only reaches this task via a
@@ -126,6 +193,7 @@ pub async fn runtime_config_watch(
     // Source 1: instance availability (watches DiscoveryQuery::Endpoint)
     let client = endpoint.client().await?;
     let mut instance_ids_rx = client.instance_avail_watcher();
+    let mut discovered_ids_rx = client.instance_source_watcher();
 
     // Source 2: runtime configs from discovery (watches DiscoveryQuery::EndpointModels)
     let discovery = component.drt().discovery();
@@ -142,7 +210,17 @@ pub async fn runtime_config_watch(
         .await?;
     let mut configs_rx = base_runtime_config_watch(stream, lifecycle.clone());
 
-    let (tx, rx) = watch::channel(HashMap::new());
+    let initial_routable = instance_ids_rx.borrow().clone();
+    let initial_discovered = discovered_ids_rx
+        .borrow()
+        .iter()
+        .map(|instance| instance.id())
+        .collect::<Vec<_>>();
+    let initial_configs = configs_rx.borrow().clone();
+    let (initial_ready, initial_admission_count) =
+        join_runtime_configs(initial_routable, initial_discovered, &initial_configs);
+    let (tx, rx) = watch::channel(initial_ready);
+    let (admission_count_tx, admission_worker_count) = watch::channel(initial_admission_count);
 
     tokio::spawn(async move {
         loop {
@@ -151,6 +229,7 @@ pub async fn runtime_config_watch(
                 _ = lifecycle.cancelled() => break,
                 _ = tx.closed() => break,
                 result = instance_ids_rx.changed() => { if result.is_err() { break; } }
+                result = discovered_ids_rx.changed() => { if result.is_err() { break; } }
                 result = configs_rx.changed() => { if result.is_err() { break; } }
             }
 
@@ -160,11 +239,18 @@ pub async fn runtime_config_watch(
                 .copied()
                 .collect();
             let configs = configs_rx.borrow_and_update().clone();
-
-            let ready: HashMap<WorkerId, ModelRuntimeConfig> = instances
-                .into_iter()
-                .filter_map(|id| configs.get(&id).map(|cfg| (id, cfg.clone())))
+            let discovered: HashSet<WorkerId> = discovered_ids_rx
+                .borrow_and_update()
+                .iter()
+                .map(|instance| instance.id())
                 .collect();
+
+            let (ready, admission_count) = join_runtime_configs(instances, discovered, &configs);
+            if *admission_count_tx.borrow() != admission_count
+                && admission_count_tx.send(admission_count).is_err()
+            {
+                break;
+            }
 
             // Only send if the joined result actually changed, to avoid waking
             // downstream consumers (wait_for, changed) on no-op recomputations.
@@ -179,7 +265,10 @@ pub async fn runtime_config_watch(
         }
     });
 
-    Ok(rx)
+    Ok(RuntimeConfigWatch {
+        ready: rx,
+        admission_worker_count,
+    })
 }
 
 #[cfg(test)]
@@ -200,6 +289,17 @@ mod tests {
             card_json: serde_json::to_value(card).unwrap(),
             model_suffix: model_suffix.map(str::to_string),
         }
+    }
+
+    #[test]
+    fn admission_count_survives_transient_routing_inhibition() {
+        let config = ModelDeploymentCard::default().runtime_config;
+        let configs = HashMap::from([(7, config)]);
+
+        let (ready, admission_count) = join_runtime_configs([], [7], &configs);
+
+        assert!(ready.is_empty());
+        assert_eq!(admission_count, 1);
     }
 
     /// Regression test for the "WorkerSet churn" leak this fix closes:

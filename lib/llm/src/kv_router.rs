@@ -2289,7 +2289,7 @@ mod tests {
         KvRouter::new_with_worker_role(
             endpoint,
             client,
-            workers,
+            workers.into(),
             None,
             16,
             DefaultWorkerSelector::new(Some(config.clone()), "decode"),
@@ -2351,7 +2351,7 @@ mod tests {
         KvRouter::new_with_worker_role(
             endpoint,
             client,
-            rx,
+            rx.into(),
             None,
             2,
             selector,

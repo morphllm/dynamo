@@ -924,7 +924,7 @@ mod tests {
         let chooser = KvRouter::new(
             endpoint,
             client.clone(),
-            workers,
+            workers.into(),
             None,
             16,
             DefaultWorkerSelector::new(Some(config.clone()), "decode"),
@@ -1467,7 +1467,7 @@ mod tests {
         let chooser = KvRouter::new(
             endpoint,
             client.clone(),
-            workers,
+            workers.into(),
             None,
             16,
             DefaultWorkerSelector::new(Some(config.clone()), "decode"),

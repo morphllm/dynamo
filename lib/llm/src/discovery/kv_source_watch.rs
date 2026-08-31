@@ -416,7 +416,8 @@ mod tests {
         let (_configs_tx, configs_rx) = watch::channel(configs);
         let discovery: Arc<dyn Discovery> =
             Arc::new(MockDiscovery::new(Some(1), SharedMockRegistry::new()));
-        let coordinator = KvSourceMembershipCoordinator::start(serving, configs_rx, discovery);
+        let coordinator =
+            KvSourceMembershipCoordinator::start(serving, configs_rx.into(), discovery);
         let base = coordinator.subscribe();
         let worker = WorkerWithDpRank::new(42, 4);
         let mut filtered_view = base.borrow().clone();
@@ -446,7 +447,7 @@ mod tests {
         let discovery: Arc<dyn Discovery> =
             Arc::new(MockDiscovery::new(Some(1), SharedMockRegistry::new()));
         let coordinator =
-            KvSourceMembershipCoordinator::start(serving, configs_rx, discovery.clone());
+            KvSourceMembershipCoordinator::start(serving, configs_rx.into(), discovery.clone());
         let mut watch = coordinator.subscribe();
         let worker = WorkerWithDpRank::new(42, 4);
         assert_eq!(
@@ -484,8 +485,11 @@ mod tests {
         let (_configs_tx, configs_rx) = watch::channel(configs);
         let discovery: Arc<dyn Discovery> =
             Arc::new(MockDiscovery::new(Some(1), SharedMockRegistry::new()));
-        let coordinator =
-            KvSourceMembershipCoordinator::start(serving.clone(), configs_rx, discovery.clone());
+        let coordinator = KvSourceMembershipCoordinator::start(
+            serving.clone(),
+            configs_rx.into(),
+            discovery.clone(),
+        );
         let mut watch = coordinator.subscribe();
         let worker = WorkerWithDpRank::new(42, 4);
         let fallback_source = source(&serving, 42, 100);
@@ -508,8 +512,11 @@ mod tests {
             watch::channel(HashMap::from([(42, runtime_config(Some(kv_a.clone())))]));
         let discovery: Arc<dyn Discovery> =
             Arc::new(MockDiscovery::new(Some(1), SharedMockRegistry::new()));
-        let coordinator =
-            KvSourceMembershipCoordinator::start(serving.clone(), configs_rx, discovery.clone());
+        let coordinator = KvSourceMembershipCoordinator::start(
+            serving.clone(),
+            configs_rx.into(),
+            discovery.clone(),
+        );
         let mut slow_consumer = coordinator.subscribe();
         let worker = WorkerWithDpRank::new(42, 4);
 

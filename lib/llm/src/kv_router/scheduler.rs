@@ -103,9 +103,11 @@ where
             .map(|(index, class)| (class.name.clone(), index))
             .collect();
 
-        let inner = Arc::new(LocalScheduler::new_with_policy_profile(
+        let admission_worker_count = workers_with_configs.admission_worker_count();
+        let inner = Arc::new(LocalScheduler::new_with_policy_profile_and_admission_count(
             slots,
-            workers_with_configs.clone(),
+            workers_with_configs.ready_receiver(),
+            Some(admission_worker_count),
             profile,
             block_size,
             selector,
@@ -530,7 +532,7 @@ mod tests {
         let scheduler = KvScheduler::start(
             component.endpoint("generate"),
             64,
-            cfg_rx,
+            cfg_rx.into(),
             DefaultWorkerSelector::new(Some(config.clone()), "decode"),
             &config,
             None,

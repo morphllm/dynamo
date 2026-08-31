@@ -649,7 +649,7 @@ mod tests {
         workers.insert(1, runtime_config);
 
         let (tx, rx) = watch::channel(workers);
-        (rx, tx)
+        (rx.into(), tx)
     }
 
     fn runtime_watch_with_config(config: SglangHicacheMooncakeConfig) -> RuntimeConfigWatch {
@@ -777,7 +777,7 @@ mod tests {
     #[test]
     fn test_kv_events_endpoint_tracks_runtime_config_updates() {
         let (runtime_configs, tx) = runtime_watch_with_config_and_sender(mooncake_config());
-        let cache = HicacheSharedKvCache::new(runtime_configs);
+        let cache = HicacheSharedKvCache::new(runtime_configs.into());
         assert_eq!(
             cache.kv_events_endpoint().as_deref(),
             Some("tcp://127.0.0.1:5557")
@@ -815,7 +815,7 @@ mod tests {
             (1, advertised_runtime),
             (2, missing_runtime),
         ]));
-        let cache = HicacheSharedKvCache::new(runtime_configs);
+        let cache = HicacheSharedKvCache::new(runtime_configs.into());
 
         assert_eq!(
             cache.kv_events_endpoint().as_deref(),
@@ -843,7 +843,7 @@ mod tests {
     async fn test_layout_change_clears_cached_hits() {
         let config = mooncake_config();
         let (runtime_configs, tx) = runtime_watch_with_config_and_sender(config.clone());
-        let cache = HicacheSharedKvCache::new(runtime_configs);
+        let cache = HicacheSharedKvCache::new(runtime_configs.into());
         let hash = logical_page_hashes(&[1, 2, 3, 4], config.page_size, config.is_eagle)
             .pop()
             .unwrap();
@@ -1091,7 +1091,7 @@ mod tests {
     #[tokio::test]
     async fn test_subscriber_clears_state_when_runtime_config_watch_closes() {
         let (tx, runtime_configs) = watch::channel(HashMap::<WorkerId, ModelRuntimeConfig>::new());
-        let cache = HicacheSharedKvCache::new(runtime_configs);
+        let cache = HicacheSharedKvCache::new(runtime_configs.into());
         cache.apply_batch(
             1,
             vec![MooncakeObjectEvent {

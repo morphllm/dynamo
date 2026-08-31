@@ -2477,7 +2477,7 @@ mod tests {
         configs: HashMap<WorkerId, ModelRuntimeConfig>,
     ) {
         let (_tx, rx) = tokio::sync::watch::channel(configs);
-        mm.runtime_configs.insert(endpoint_id.clone(), rx);
+        mm.runtime_configs.insert(endpoint_id.clone(), rx.into());
     }
 
     #[tokio::test]
@@ -2500,19 +2500,19 @@ mod tests {
 
         let mut first = manager.get_or_create_kv_source_membership_watch_with(
             serving_endpoint.clone(),
-            configs_rx.clone(),
+            configs_rx.clone().into(),
             discovery.clone(),
         );
         let mut second = manager.get_or_create_kv_source_membership_watch_with(
             serving_endpoint.clone(),
-            configs_rx.clone(),
+            configs_rx.clone().into(),
             discovery.clone(),
         );
         assert!(first.shares_coordinator_with(&second));
         let other_endpoint = EndpointId::from("ns.worker.generate-b");
         let other = manager.get_or_create_kv_source_membership_watch_with(
             other_endpoint,
-            configs_rx,
+            configs_rx.into(),
             discovery.clone(),
         );
         assert!(!first.shares_coordinator_with(&other));
@@ -2803,11 +2803,14 @@ mod tests {
         let retained = tokio_util::sync::CancellationToken::new();
         manager.hicache_caches.insert(
             EndpointId::from("ns.worker.generate"),
-            HicacheSharedKvCache::new_with_cancellation(runtime_configs.clone(), cancelled.clone()),
+            HicacheSharedKvCache::new_with_cancellation(
+                runtime_configs.clone().into(),
+                cancelled.clone(),
+            ),
         );
         manager.hicache_caches.insert(
             EndpointId::from("ns.other.generate"),
-            HicacheSharedKvCache::new_with_cancellation(runtime_configs, retained.clone()),
+            HicacheSharedKvCache::new_with_cancellation(runtime_configs.into(), retained.clone()),
         );
 
         manager.remove_hicache_caches("ns", "worker");

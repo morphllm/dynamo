@@ -1433,7 +1433,7 @@ async fn run_endpoint_slot(
                 let (sender, configs) = watch::channel(membership.runtime_configs.clone());
                 let coordinator = KvSourceMembershipCoordinator::start(
                     endpoint.clone(),
-                    configs,
+                    configs.into(),
                     component.drt().discovery(),
                 );
                 source_watch = Some(coordinator.subscribe());

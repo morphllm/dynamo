@@ -227,6 +227,7 @@ struct SchedulerQueueActor<
     class_counters: Arc<Vec<ClassQueueCounters>>,
     slots: Arc<ActiveSequencesMultiWorker<P>>,
     workers_with_configs: watch::Receiver<HashMap<WorkerId, C>>,
+    admission_worker_count: Option<watch::Receiver<usize>>,
     start_time: Instant,
     block_size: u32,
     selector: Sel,
@@ -312,9 +313,37 @@ impl<
         overloaded_worker_provider: Option<OverloadedWorkerProvider>,
         available_worker_provider: Option<WorkerAvailabilityProvider>,
     ) -> Result<Self, KvSchedulerError> {
+        Self::new_with_policy_profile_and_admission_count(
+            slots,
+            workers_with_configs,
+            None,
+            profile,
+            block_size,
+            selector,
+            prefill_load_estimator,
+            overlap_scores_refresh,
+            overloaded_worker_provider,
+            available_worker_provider,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_policy_profile_and_admission_count(
+        slots: Arc<ActiveSequencesMultiWorker<P>>,
+        workers_with_configs: watch::Receiver<HashMap<WorkerId, C>>,
+        admission_worker_count: Option<watch::Receiver<usize>>,
+        profile: PolicyProfile,
+        block_size: u32,
+        selector: Sel,
+        prefill_load_estimator: Option<Arc<dyn PrefillLoadEstimator>>,
+        overlap_scores_refresh: Option<Arc<RF>>,
+        overloaded_worker_provider: Option<OverloadedWorkerProvider>,
+        available_worker_provider: Option<WorkerAvailabilityProvider>,
+    ) -> Result<Self, KvSchedulerError> {
         Self::new_with_policy_profile_and_capacity(
             slots,
             workers_with_configs,
+            admission_worker_count,
             profile,
             block_size,
             selector,
@@ -330,6 +359,7 @@ impl<
     fn new_with_policy_profile_and_capacity(
         slots: Arc<ActiveSequencesMultiWorker<P>>,
         workers_with_configs: watch::Receiver<HashMap<WorkerId, C>>,
+        admission_worker_count: Option<watch::Receiver<usize>>,
         profile: PolicyProfile,
         block_size: u32,
         selector: Sel,
@@ -395,6 +425,7 @@ impl<
             class_counters: Arc::clone(&class_counters),
             slots: Arc::clone(&slots),
             workers_with_configs: workers_with_configs.clone(),
+            admission_worker_count,
             start_time: Instant::now(),
             block_size,
             selector,
@@ -804,7 +835,10 @@ impl<
             enqueue_at: decay_now,
             block_hashes,
         };
-        let worker_count = self.workers_with_configs.borrow().len();
+        let worker_count = self.admission_worker_count.as_ref().map_or_else(
+            || self.workers_with_configs.borrow().len(),
+            |count| *count.borrow(),
+        );
         if let Err((rejection, queued)) = self.pending.enqueue(
             class_index,
             worker_count,
@@ -1852,6 +1886,7 @@ mod tests {
             SchedulerQueue::new_with_policy_profile_and_capacity(
                 Arc::clone(&slots),
                 cfg_rx,
+                None,
                 PolicyProfile::synthetic(threshold_frac, crate::config::RouterQueuePolicy::Fcfs),
                 block_size,
                 DefaultWorkerSelector::new(None, "test"),
@@ -2725,6 +2760,74 @@ policy_classes:
         assert_eq!(rejection.current, 2);
         assert_eq!(rejection.limit, 1);
         assert_eq!(queue.pending_count(), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn admission_limit_uses_authoritative_count_when_fewer_workers_are_ready() {
+        let profile = policy_profile(
+            r#"
+default_policy_family: capped
+uncached_isl_buckets:
+  - min_tokens: 0
+    bucket: all
+policy_classes:
+  - name: capped
+    policy_family: capped
+    cache_bucket: all
+    quantum: 1
+    prefill_busy_threshold: 0
+    request_queue_limit_per_worker: 1
+"#,
+        );
+        let slots = Arc::new(ActiveSequencesMultiWorker::new(
+            NoopSequencePublisher,
+            16,
+            HashMap::from([(0, (0, 1))]),
+            false,
+            0,
+            "test",
+        ));
+        let (_ready_tx, ready_rx) = watch::channel(HashMap::from([(
+            0,
+            SimpleWorkerConfig {
+                max_num_batched_tokens: Some(64),
+                ..Default::default()
+            },
+        )]));
+        let (_count_tx, count_rx) = watch::channel(2usize);
+        let queue = SchedulerQueue::new_with_policy_profile_and_admission_count(
+            slots,
+            ready_rx,
+            Some(count_rx),
+            profile,
+            16,
+            DefaultWorkerSelector::new(None, "test"),
+            None,
+            None::<Arc<NoopOverlapScoresRefresh>>,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let (active, active_rx) = make_request("active", 64);
+        queue.enqueue(active).await;
+        active_rx.await.unwrap().unwrap();
+
+        let (first, _first_rx) = make_request("first", 64);
+        queue.enqueue(first).await;
+
+        let (second, _second_rx) = make_request("second", 64);
+        queue.enqueue(second).await;
+        assert_eq!(queue.pending_count(), 2);
+
+        let (rejected, rejected_rx) = make_request("rejected", 64);
+        queue.enqueue(rejected).await;
+        let KvSchedulerError::QueueRejected(rejection) = rejected_rx.await.unwrap().unwrap_err()
+        else {
+            panic!("expected a typed queue rejection");
+        };
+        assert_eq!(rejection.current, 2);
+        assert_eq!(rejection.limit, 2);
     }
 
     #[tokio::test(start_paused = true)]

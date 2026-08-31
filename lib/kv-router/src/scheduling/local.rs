@@ -198,9 +198,47 @@ where
         worker_type: &'static str,
         monitor_worker_configs: bool,
     ) -> Result<Self, KvSchedulerError> {
-        let queue = Arc::new(SchedulerQueue::new_with_policy_profile(
+        Self::new_with_policy_profile_and_admission_count(
+            slots,
+            workers_with_configs,
+            None,
+            profile,
+            block_size,
+            selector,
+            prefill_load_estimator,
+            overlap_scores_refresh,
+            overloaded_worker_provider,
+            available_worker_provider,
+            recheck_interval,
+            track_prefill_tokens_default,
+            cancellation_token,
+            worker_type,
+            monitor_worker_configs,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_policy_profile_and_admission_count(
+        slots: Arc<ActiveSequencesMultiWorker<P>>,
+        workers_with_configs: watch::Receiver<HashMap<WorkerId, C>>,
+        admission_worker_count: Option<watch::Receiver<usize>>,
+        profile: PolicyProfile,
+        block_size: u32,
+        selector: Sel,
+        prefill_load_estimator: Option<Arc<dyn PrefillLoadEstimator>>,
+        overlap_scores_refresh: Option<Arc<RF>>,
+        overloaded_worker_provider: Option<OverloadedWorkerProvider>,
+        available_worker_provider: Option<WorkerAvailabilityProvider>,
+        recheck_interval: Duration,
+        track_prefill_tokens_default: bool,
+        cancellation_token: CancellationToken,
+        worker_type: &'static str,
+        monitor_worker_configs: bool,
+    ) -> Result<Self, KvSchedulerError> {
+        let queue = Arc::new(SchedulerQueue::new_with_policy_profile_and_admission_count(
             Arc::clone(&slots),
             workers_with_configs.clone(),
+            admission_worker_count,
             profile,
             block_size,
             selector,
